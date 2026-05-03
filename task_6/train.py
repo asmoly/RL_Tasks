@@ -6,7 +6,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import PPO
 
-PATH_TO_MODEL = None
+PATH_TO_MODEL = "saves\ppo_car_racing_iter_10.pth"
 SAVE_FREQUENCY = 5
 PATH_TO_LOGS = "runs/ppo_car_racing_v1"
 
@@ -163,7 +163,7 @@ def train(device, envs, model, optimizer, start_iteration, writer):
     obs, _ = envs.reset()
     obs = torch.from_numpy(obs).to(device).float().permute(0, 3, 1, 2)
 
-    for iteration in range(start_iteration, TOTAL_ITERATIONS):
+    for iteration in range(start_iteration + 1, TOTAL_ITERATIONS):
         data = collect_rollout(envs, model, obs, ROLLOUT_STEPS, device)
         obs = data["last_obs"] # Save for the next iteration
 
@@ -184,6 +184,7 @@ def train(device, envs, model, optimizer, start_iteration, writer):
         total_loss = 0
         total_actor_loss = 0
         total_critic_loss = 0
+        total_entropy = 0
         for epoch in range(EPOCHS):
             indices = torch.randperm(batch_size) # Shuffles indicies for better learning
 
@@ -239,14 +240,17 @@ def train(device, envs, model, optimizer, start_iteration, writer):
                 total_loss += loss.item()
                 total_actor_loss += actor_loss.item()
                 total_critic_loss += critic_loss.item()
+                total_entropy += entropy.item()
 
         avg_total_loss = total_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
         avg_actor_loss = total_actor_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
         avg_critic_loss = total_critic_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
+        avg_entropy = total_entropy/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
 
         writer.add_scalar("Loss/Actor", avg_actor_loss, iteration)
         writer.add_scalar("Loss/Critic", avg_critic_loss, iteration)
         writer.add_scalar("Loss/Total", avg_total_loss, iteration)
+        writer.add_scalar("Entropy", avg_entropy, iteration)
 
         print(f"Iteration: {iteration}, Total Loss = {avg_total_loss}, Actor Loss = {avg_actor_loss}, Critic Loss = {avg_critic_loss}")
 
@@ -262,12 +266,12 @@ def main():
     envs = initialize_env()
 
     model = initialize_model(device)
+    optimizer = initialize_optimizer(model)
 
     start_iteration = 0
     if PATH_TO_MODEL != None:
         start_iteration = load_ppo_model(model, optimizer, PATH_TO_MODEL, device)
 
-    optimizer = initialize_optimizer(model)
     print("Initialized variables")
 
     print("Beggining training")

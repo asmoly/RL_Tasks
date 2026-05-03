@@ -4,7 +4,7 @@ import os
 
 from train import initialize_device, initialize_model
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_0.pth"
+PATH_TO_MODEL = "saves\ppo_car_racing_iter_10.pth"
 
 def initialize_run_env():
     env = gym.make("CarRacing-v3", continuous=True, render_mode="human")
