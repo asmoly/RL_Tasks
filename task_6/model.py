@@ -5,7 +5,7 @@ from tensordict.nn import TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 
 class PPO(nn.Module):
-    def __init__(self, input_channels=3, action_dim=3):
+    def __init__(self, input_channels=4, action_dim=3):
         super().__init__()
         
         self.encoder = nn.Sequential(
@@ -20,9 +20,11 @@ class PPO(nn.Module):
             nn.ReLU()
         )
 
-        self.actor_mean = nn.Linear(512, action_dim) # Mean outputs the actual predicted value for each action
+        # self.actor_mean = nn.Linear(512, action_dim) # Mean outputs the actual predicted value for each action
+        self.steering_mean =    nn.Linear(512, 1) # Range: [-1, 1]
+        self.throttle_mean = nn.Linear(512, 2) # Range: [0, 1] (Gas and Brake)
 
-        self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim)) # std is the confidence of the action, lower means higher confidence
+        self.actor_log_std = nn.Parameter(torch.full((1, action_dim), -0.5)) # std is the confidence of the action, lower means higher confidence
         # Action is later sampled using a normal distribution from the mean and the std 
         # Also it is predicting the log of the std, later we take the exp(log(std)) which garantues it to be positive
         # It is initialized with a tensor [[0, 0, 0]] becaue e^0 = 1 so the std will start at 1
@@ -33,7 +35,12 @@ class PPO(nn.Module):
     def forward(self, obs):
         features = self.encoder(obs/255.0) # Normalize pixel values
         
-        mean = self.actor_mean(features) # Get mean from actor
+        # mean = self.actor_mean(features) # Get mean from actor
+        steer = torch.tanh(self.steering_mean(features)) # tanh making it -1 to 1
+        throttle = torch.sigmoid(self.throttle_mean(features)) # sigmoid makes it 0 to 1
+        
+        mean = torch.cat([steer, throttle], dim=-1) # Concatinates the two heads
+
         std = torch.exp(self.actor_log_std).expand_as(mean) # Does e^(log(std)) to get the std, when expanding the [1, 3] std to the batch dimension of the mean
         
         # Gets the predicted reward from the critic

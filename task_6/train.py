@@ -6,11 +6,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import PPO
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_10.pth"
+PATH_TO_MODEL = "saves\ppo_car_racing_iter_280.pth"
 SAVE_FREQUENCY = 5
-PATH_TO_LOGS = "runs/ppo_car_racing_v1"
+PATH_TO_LOGS = "runs/ppo_car_racing_v3"
 
-TOTAL_ITERATIONS = 1000
+TOTAL_ITERATIONS = 2000
 ROLLOUT_STEPS = 2048
 MINI_BATCH_SIZE = 64
 EPOCHS = 10
@@ -68,9 +68,11 @@ def initialize_tensorboard(path_to_logs):
 # This defines a function on how to create the environemnt
 def make_env():
     env = gym.make("CarRacing-v3", continuous=True) # Continuous=True is important since controls are continuous
+    env = gym.wrappers.GrayscaleObservation(env, keep_dim=False) # Converts to grayscale
+    env = gym.wrappers.FrameStackObservation(env, stack_size=4) # Stacks the last 4 frames as channels of the image for history, so the channel dimension is now 4 rather than 3 for rgb 
     return env
 
-def initialize_env(num_envs=4):
+def initialize_env(num_envs=16):
     envs = gym.vector.AsyncVectorEnv([make_env for _ in range(num_envs)])
     return envs
 
@@ -91,8 +93,10 @@ def collect_rollout(envs, model, current_obs, num_steps, device):
     dones_batch = []
 
     for _ in range(num_steps):
+        obs_batch.append(current_obs) # State
+        
         with torch.no_grad():
-            # Current_obs shape: (num_envs, 3, 96, 96)
+            # Current_obs shape: (num_envs, 4, 96, 96)
             mean, std, value = model(current_obs)
             
             dist = torch.distributions.Normal(mean, std) # Creates the normal distribution
@@ -104,10 +108,10 @@ def collect_rollout(envs, model, current_obs, num_steps, device):
         env_action = torch.clamp(action, -1, 1).cpu().numpy() # Clip the actions to match what the environment expects
         next_obs, reward, terminated, truncated, info = envs.step(env_action)
 
-        current_obs = torch.from_numpy(next_obs).to(device).float().permute(0, 3, 1, 2)
+        current_obs = torch.from_numpy(next_obs).to(device).float()
         
         # This appends everything we need for the loss function
-        obs_batch.append(current_obs) # State
+        #obs_batch.append(current_obs) # State
         actions_batch.append(action) # Action
         logprobs_batch.append(logprob) # Probability of that action
         # This gets flattened because often we get the dimension (num_env, 1, 1) do to the nature of linear layers
@@ -161,7 +165,7 @@ def calculate_advantage(rewards, values, dones, last_value, gamma=0.99, lam=0.95
 def train(device, envs, model, optimizer, start_iteration, writer):
     # Reseting environment and converting to tensor
     obs, _ = envs.reset()
-    obs = torch.from_numpy(obs).to(device).float().permute(0, 3, 1, 2)
+    obs = torch.from_numpy(obs).to(device).float()
 
     for iteration in range(start_iteration + 1, TOTAL_ITERATIONS):
         data = collect_rollout(envs, model, obs, ROLLOUT_STEPS, device)
@@ -172,7 +176,7 @@ def train(device, envs, model, optimizer, start_iteration, writer):
             advantages, returns = calculate_advantage(data["rewards"], data["values"], data["dones"], last_value.flatten())
 
         # Collapses all data (coverts (steps, num_envs) to (steps*num_envs))
-        b_obs = data["obs"].reshape((-1, 3, 96, 96))
+        b_obs = data["obs"].reshape((-1, 4, 96, 96))
         b_actions = data["actions"].reshape((-1, 3))
         b_logprobs = data["logprobs"].reshape(-1)
         b_advantages = advantages.reshape(-1)
