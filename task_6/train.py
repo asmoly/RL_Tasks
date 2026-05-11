@@ -6,14 +6,15 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import PPO
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_280.pth"
+PATH_TO_MODEL = "saves\ppo_car_racing_iter_1625.pth"
 SAVE_FREQUENCY = 5
-PATH_TO_LOGS = "runs/ppo_car_racing_v3"
+PATH_TO_LOGS = "runs/ppo_car_racing_v3_2"
 
 TOTAL_ITERATIONS = 2000
 ROLLOUT_STEPS = 2048
-MINI_BATCH_SIZE = 64
+MINI_BATCH_SIZE = 512
 EPOCHS = 10
+LR = 1e-4
 
 EPSILON = 0.2
 CRITIC_WEIGHT = 0.5
@@ -81,7 +82,7 @@ def initialize_model(device):
     return model
 
 def initialize_optimizer(model):
-    optimizer = optim.Adam(model.parameters(), lr=3e-4, eps=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
     return optimizer
 
 def collect_rollout(envs, model, current_obs, num_steps, device):
@@ -116,7 +117,7 @@ def collect_rollout(envs, model, current_obs, num_steps, device):
         logprobs_batch.append(logprob) # Probability of that action
         # This gets flattened because often we get the dimension (num_env, 1, 1) do to the nature of linear layers
         values_batch.append(value.flatten()) # Predicted Rewards
-        rewards_batch.append(torch.tensor(reward).to(device)) # Actual reward
+        rewards_batch.append(torch.tensor(reward).to(device) * 0.1) # Actual reward (also normalizing so that the rewards aren't huge)
         dones_batch.append(torch.tensor(terminated | truncated).to(device)) # Done
 
     return {

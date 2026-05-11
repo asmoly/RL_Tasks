@@ -21,8 +21,13 @@ class PPO(nn.Module):
         )
 
         # self.actor_mean = nn.Linear(512, action_dim) # Mean outputs the actual predicted value for each action
-        self.steering_mean =    nn.Linear(512, 1) # Range: [-1, 1]
+        self.steering_mean = nn.Linear(512, 1) # Range: [-1, 1]
         self.throttle_mean = nn.Linear(512, 2) # Range: [0, 1] (Gas and Brake)
+
+        # This initializes the biases for the throttle and brake so that the car initialy presses teh gas, and doesn't press the brake
+        with torch.no_grad():
+            self.throttle_mean.bias[0] = 2.0 # 2 run through sigmoid is about 0.88 which is a good initial gas value
+            self.throttle_mean.bias[1] = -2.0 # This initializes teh breaks to a negative bias so it doesn't just brake
 
         self.actor_log_std = nn.Parameter(torch.full((1, action_dim), -0.5)) # std is the confidence of the action, lower means higher confidence
         # Action is later sampled using a normal distribution from the mean and the std 
