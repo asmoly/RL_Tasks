@@ -4,24 +4,27 @@ import torch.optim as optim
 import gymnasium as gym
 from torch.utils.tensorboard import SummaryWriter
 
-from model import PPO
+from model import SAC
+from replay_buffer import ReplayBuffer
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_70.pth"
+PATH_TO_MODEL = None
 SAVE_FREQUENCY = 5
-PATH_TO_LOGS = "runs/ppo_car_racing_v4"
+PATH_TO_LOGS = "runs/sac_car_racing_v1"
 
-TOTAL_ITERATIONS = 2000
-ROLLOUT_STEPS = 2048
-MINI_BATCH_SIZE = 512
-EPOCHS = 10
 LR = 1e-4
 
-EPSILON = 0.2
-CRITIC_WEIGHT = 0.5
-ENTROPY_WEIGHT = 0.01
+LAMBDA = 0.99
+
+SAMPLE_BATCH_SIZE = 256
+NUM_WARMUP_STEPS = 1024
+NUM_ITERATIONS = 2000000
+
+BUFFER_CAPACITY = 1000000
+STATE_SHAPE = (4, 96, 96)
+ACTION_DIM = 3
 
 # Saves model, as well as parameteres
-def save_ppo_model(model, optimizer, iteration, name="ppo_car_racing"):
+def save_model(model, optimizer, iteration, name="ppo_car_racing"):
     if not os.path.exists("saves"):
         os.makedirs("saves")
         
@@ -36,7 +39,7 @@ def save_ppo_model(model, optimizer, iteration, name="ppo_car_racing"):
     torch.save(checkpoint, filename)
     print(f"Model saved to {filename}")
 
-def load_ppo_model(model, optimizer, filename, device):
+def load_model(model, optimizer, filename, device):
     if os.path.exists(filename):
         checkpoint = torch.load(filename, map_location=device)
         
@@ -73,194 +76,154 @@ def make_env():
     env = gym.wrappers.FrameStackObservation(env, stack_size=4) # Stacks the last 4 frames as channels of the image for history, so the channel dimension is now 4 rather than 3 for rgb 
     return env
 
+# Creates a specific amount of environments in parrallel
 def initialize_env(num_envs=16):
     envs = gym.vector.AsyncVectorEnv([make_env for _ in range(num_envs)])
     return envs
 
 def initialize_model(device):
-    model = PPO().to(device)
+    model = SAC().to(device)
     return model
 
 def initialize_optimizer(model):
-    optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
-    return optimizer
+    # This optimizer is for the actor
+    actor_optimizer = torch.optim.Adam(
+        list(model.encoder.parameters()) + 
+        list(model.action_mean.parameters()) + 
+        list(model.actor_log_std_head.parameters()), 
+        lr=LR
+    )
 
-def collect_rollout(envs, model, current_obs, num_steps, device):
-    obs_batch = []
-    actions_batch = []
-    logprobs_batch = []
-    values_batch = []
-    rewards_batch = []
-    dones_batch = []
+    # This optimizer is for the two critics
+    critic_optimizer = torch.optim.Adam(
+        list(model.critic_a.parameters()) + 
+        list(model.critic_b.parameters()), 
+        lr=LR
+    )
 
-    for _ in range(num_steps):
-        obs_batch.append(current_obs) # State
-        
-        with torch.no_grad():
-            # Current_obs shape: (num_envs, 4, 96, 96)
-            mean, std, value = model(current_obs)
-            
-            dist = torch.distributions.Normal(mean, std) # Creates the normal distribution
-            action = dist.sample() # Samples from that distribution
+    return actor_optimizer, critic_optimizer
 
-            logprob = dist.log_prob(action).sum(axis=-1) # Gets the probability of each action from the distribution, and sums them
-            # This basically gives you the probability that the model chose that action
+def buffer_step(device, envs, model, replay_buffer, current_obs):
+    action, log_prob = model.forward(current_obs)
+    action[:, 1:] = (action[:, 1:] + 1)/2 # This shrinks the throttle and brake to a range of 0 and 1
 
-        env_action = torch.clamp(action, -1, 1).cpu().numpy() # Clip the actions to match what the environment expects
-        next_obs, reward, terminated, truncated, info = envs.step(env_action)
-
-        current_obs = torch.from_numpy(next_obs).to(device).float()
-        
-        # This appends everything we need for the loss function
-        #obs_batch.append(current_obs) # State
-        actions_batch.append(action) # Action
-        logprobs_batch.append(logprob) # Probability of that action
-        # This gets flattened because often we get the dimension (num_env, 1, 1) do to the nature of linear layers
-        values_batch.append(value.flatten()) # Predicted Rewards
-        rewards_batch.append(torch.tensor(reward).to(device) * 0.1) # Actual reward (also normalizing so that the rewards aren't huge)
-        dones_batch.append(torch.tensor(terminated | truncated).to(device)) # Done
-
-    return {
-        "obs": torch.stack(obs_batch),       # Shape: (steps, num_envs, 3, 96, 96)
-        "actions": torch.stack(actions_batch),
-        "logprobs": torch.stack(logprobs_batch),
-        "values": torch.stack(values_batch),
-        "rewards": torch.stack(rewards_batch),
-        "dones": torch.stack(dones_batch),
-        "last_obs": current_obs
-    }
+    next_obs, reward, terminated, truncated, info = envs.step(action)
+    next_obs = torch.from_numpy(current_obs).to(device).float()
     
+    replay_buffer.add(current_obs, action, reward, next_obs, terminated or truncated) # Adds the step to the buffer
 
-def calculate_advantage(rewards, values, dones, last_value, gamma=0.99, lam=0.95):
-    # rewards, values, and dones have shape (steps, num_envs)
+    if terminated or truncated:
+        next_obs, _ = envs.reset()
+        next_obs = torch.from_numpy(current_obs).to(device).float()
 
-    num_steps = len(rewards) # This gets the length of the rollout being proccessed
-    advantages = torch.zeros_like(rewards) # Create a 0 tensor of same shape as rewards
-    previous_advantages = 0 # Stores all previous advantages, so that the first action will have highest weight
+    return next_obs
+
+def train(device, envs, model, actor_optimizer, critic_optimizer, start_iteration, writer, replay_buffer):
+    # 1. Create a Target Model (Physical copy for stable targets)
+    from copy import deepcopy
+    target_model = deepcopy(model).to(device)
+    for p in target_model.parameters():
+        p.requires_grad = False  # Target networks never learn via gradients
     
-    # We walk backwards through time
-    for t in reversed(range(num_steps)):
-        if t == num_steps - 1: # If it is the last value in the tensor, then we use the parameter as the next value
-            next_value = last_value # Next value is the predicted value of the state after the rollout
-        else:
-            next_value = values[t + 1] # Otherwise we can just get it from the values tensor
-            
-        mask = 1.0 - dones[t].float() # Dones is a mask where 0 is running, 1 is done, so we do 1 - dones to get mask for current value
-        
-        # Calculates the error (from the formulas for PPO in my powerpoint)
-        # If delta is positive then this action resulted in a better reward than what the critic expected
-        # if delta is negative it was worse
-        delta = rewards[t] + (gamma*next_value*mask) - values[t]
-        
-        # 4. Apply the GAE smoothing factor (lambda)
-        # This links the current delta with the 'future' deltas we already calculated
-        previous_advantages = delta + (gamma * lam * mask * previous_advantages)
-        advantages[t] = previous_advantages
-        
-    # Returns are what the Critic should have predicted (Value + Advantage)
-    returns = advantages + values
+    # This sets up the auto alpha (just the weight for log probability, it also gets optimized)
+    target_entropy = -ACTION_DIM 
+    log_alpha = torch.zeros(1, requires_grad=True, device=device)
+    alpha_optimizer = torch.optim.Adam([log_alpha], lr=LR)
     
-    return advantages, returns
-
-
-def train(device, envs, model, optimizer, start_iteration, writer):
     # Reseting environment and converting to tensor
     obs, _ = envs.reset()
     obs = torch.from_numpy(obs).to(device).float()
+    TAU = 0.005 # Soft update coefficient
 
-    for iteration in range(start_iteration + 1, TOTAL_ITERATIONS):
-        data = collect_rollout(envs, model, obs, ROLLOUT_STEPS, device)
-        obs = data["last_obs"] # Save for the next iteration
+    # Adds some starter data to the buffer
+    for i in range(0, NUM_WARMUP_STEPS):
+        obs = buffer_step(device, envs, model, replay_buffer, obs)
+
+    for iteration in range(0, NUM_ITERATIONS):
+        obs = buffer_step(device, envs, model, replay_buffer, obs) # Take one step and add to buffer
+        
+        states, actions, rewards, next_states, dones = replay_buffer.sample(SAMPLE_BATCH_SIZE) # Get sample batch
+        
+        # Converts rewards and dones to tensors
+        rewards = torch.FloatTensor(rewards).to(device)
+        dones = torch.FloatTensor(dones).to(device)
+
+        alpha = log_alpha.exp() # Get the current alpha value
 
         with torch.no_grad():
-            _, _, last_value = model(obs) # Gets the value for the state right after the rollout
-            advantages, returns = calculate_advantage(data["rewards"], data["values"], data["dones"], last_value.flatten())
+            # Get the actions and log probs from inputting next_states into the model
+            next_dist = model.get_action_dist(next_states) # Get distribution
+            next_actions = next_dist.rsample() # Sample from dist (rsample keeps gradients)
+            next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True) # Gets the log prob from the dsitribution base don how wide it is
 
-        # Collapses all data (coverts (steps, num_envs) to (steps*num_envs))
-        b_obs = data["obs"].reshape((-1, 4, 96, 96))
-        b_actions = data["actions"].reshape((-1, 3))
-        b_logprobs = data["logprobs"].reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = data["values"].reshape(-1)
+            # Encodes the next states using the CNN
+            next_states_encoded = target_model.encoder(next_states/255.0)
 
-        batch_size = b_obs.shape[0] # Gets the batch Size
+            # Gets the critic values for the concatinated encoded states and their corresponding actions
+            next_critic_a_out = target_model.critic_a(torch.cat([next_states_encoded, next_actions], dim=-1))
+            next_critic_b_out = target_model.critic_b(torch.cat([next_states_encoded, next_actions], dim=-1))
 
-        total_loss = 0
-        total_actor_loss = 0
-        total_critic_loss = 0
-        total_entropy = 0
-        for epoch in range(EPOCHS):
-            indices = torch.randperm(batch_size) # Shuffles indicies for better learning
-
-            for start in range(0, batch_size, MINI_BATCH_SIZE): # Loops through the mini batches within the large batch
-                end = start + MINI_BATCH_SIZE
-                mb_idx = indices[start:end] # This gets a slice of random data of size MINI_BATCH_SIZE
-
-                new_mean, new_std, new_value = model(b_obs[mb_idx]) # Runs the data through the model
-                new_dist = torch.distributions.Normal(new_mean, new_std) # Creates a distribution based on the mean and std
-                new_logprobs = new_dist.log_prob(b_actions[mb_idx]).sum(-1) # Gets the probability of the action that was actually taken from the models distribution
-                
-                # Entrypy measures how certain the model is
-                # If the distribution is wide than it will be high
-                # Low entropy means the model is very confident 
-                entropy = new_dist.entropy().sum(-1).mean()
+            target = torch.min(next_critic_a_out, next_critic_b_out) - alpha*next_log_prob
+            
+            # (1 - dones) is used for the mask, it is 1 when the episode is done, so we do 1 - target so that when its done weights go to 0
+            # The rest of the formula is just the standard loss function
+            target = rewards + (1 - dones)*LAMBDA*target
 
 
-                # This calculates the PPO ratio, from my slides
-                # Ratio = New Probability / Old Probability
-                logratio = new_logprobs - b_logprobs[mb_idx] # Takes the new models lop probs and divides by the old models log probs
-                ratio = torch.exp(logratio) # e^logratio to get rid of the log
+        curr_states_encoded = model.encoder(states/255.0)
+        curr_critic_a_out = model.critic_a(torch.cat([curr_states_encoded, actions], dim=-1))
+        curr_critic_b_out = model.critic_b(torch.cat([curr_states_encoded, actions], dim=-1))
+        
+        critic_a_loss = 0.5(curr_critic_a_out - target)**2
+        critic_b_loss = 0.5(curr_critic_b_out - target)**2
 
-                # --- C. Clipped Actor Loss ---
-                # Use normalized advantages for stability
-                mb_advantages = b_advantages[mb_idx] # Gets the advantages from the data
-                mb_advantages = (mb_advantages - mb_advantages.mean())/(mb_advantages.std() + 1e-8) # Normalizes the advantages
-                # Basically centering the advatages then dividing by the spread
+        critic_loss = critic_a_loss + critic_b_loss
 
-                # l_clip_1 and l_clip_2 are from the loss formula for the actor part
-                l_clip_1 = ratio*mb_advantages
-                l_clip_2 = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)*mb_advantages
+        # Optimize the critic models
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        critic_optimizer.step()
 
-                # This is the actor loss formula from my slides, 
-                # We do negative, because normally you need to maximize the loss, but our optimizer only minimizes
-                # And we take the mean to get a concret float as the loss
-                actor_loss = -torch.min(l_clip_1, l_clip_2).mean() # Then we are taking the minimum of them
+        # CRITIC OPTIMIZATION DONE
+        # MOVING ON TO ACTOR
 
-                # This is the loss for the critic, again can be found in my slides
-                # This is just mse loss
-                # In formula this should be negative but again we are minimizing so we don't need to worry about that
-                critic_loss = 0.5*(new_value.flatten() - b_returns[mb_idx]).pow(2).mean()
-                # 0.5 is to get rid of the 2 power which comes down when differentiation happens (makes gradient cleaner)
+        # Get the distribution for the current state
+        dist = model.get_action_dist(states)
+        new_actions = dist.rsample() # Get new actions form the distribution
+        new_log_prob = dist.log_prob(new_actions).sum(-1, keepdim=True) # And the log prob
 
-                # Total loss equation
-                loss = actor_loss + (CRITIC_WEIGHT*critic_loss) - (ENTROPY_WEIGHT*entropy)
+        actor_curr_states_encoded = model.encoder(states/255.0) # Encodes the current states (we re encode so gradients flow to the actor, not the critic)
+        
+        # Gets the critic outputs from the encoded states
+        actor_curr_critic_a_out = model.critic_a(torch.cat([actor_curr_states_encoded, new_actions], dim=-1))
+        actor_curr_critic_b_out = model.critic_b(torch.cat([actor_curr_states_encoded, new_actions], dim=-1))
+        
+        # Calculates the loss function
+        actor_loss = (alpha.detach()*new_log_prob - torch.min(actor_curr_critic_a_out, actor_curr_critic_b_out)).mean()
 
-                optimizer.zero_grad()
-                loss.backward()
-                # Clip gradients to stop the model from "exploding"
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                optimizer.step()
+        # Optimizes the actor
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        actor_optimizer.step()
 
-                total_loss += loss.item()
-                total_actor_loss += actor_loss.item()
-                total_critic_loss += critic_loss.item()
-                total_entropy += entropy.item()
+        # Optimizes the alpha variable
+        alpha_loss = -(log_alpha*(new_log_prob + target_entropy).detach()).mean() # Loss for alpha (Looks like it is just optimizing towards randomness)
+        alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        alpha_optimizer.step()
 
-        avg_total_loss = total_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
-        avg_actor_loss = total_actor_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
-        avg_critic_loss = total_critic_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
-        avg_entropy = total_entropy/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
+        # This nudges the target model towards the live model
+        # If we just used the live model it would basically learn to reward itself because the loss isn't too grounded in the actual reward
+        # So we have a stable target model which laggs behind and the live model learns from it
+        with torch.no_grad():
+            for p, p_t in zip(model.parameters(), target_model.parameters()):
+                p_t.data.copy_(TAU * p.data + (1 - TAU) * p_t.data)
 
-        writer.add_scalar("Loss/Actor", avg_actor_loss, iteration)
-        writer.add_scalar("Loss/Critic", avg_critic_loss, iteration)
-        writer.add_scalar("Loss/Total", avg_total_loss, iteration)
-        writer.add_scalar("Entropy", avg_entropy, iteration)
-
-        print(f"Iteration: {iteration}, Total Loss = {avg_total_loss}, Actor Loss = {avg_actor_loss}, Critic Loss = {avg_critic_loss}")
-
-        if iteration%SAVE_FREQUENCY == 0:
-            save_ppo_model(model, optimizer, iteration)
+        # Tensorboard logging
+        if iteration % 100 == 0:
+            writer.add_scalar("Loss/Actor", actor_loss.item(), iteration)
+            writer.add_scalar("Loss/Critic", critic_loss.item(), iteration)
+            writer.add_scalar("Alpha", alpha.item(), iteration)
 
 
 
@@ -269,18 +232,19 @@ def main():
     writer = initialize_tensorboard(PATH_TO_LOGS)
     device = initialize_device()
     envs = initialize_env()
+    replay_buffer = ReplayBuffer(BUFFER_CAPACITY, STATE_SHAPE, ACTION_DIM)
 
     model = initialize_model(device)
-    optimizer = initialize_optimizer(model)
+    actor_optimizer, critic_optimizer = initialize_optimizer(model)
 
     start_iteration = 0
     if PATH_TO_MODEL != None:
-        start_iteration = load_ppo_model(model, optimizer, PATH_TO_MODEL, device)
+        start_iteration = load_model(model, optimizer, PATH_TO_MODEL, device)
 
     print("Initialized variables")
 
     print("Beggining training")
-    train(device, envs, model, optimizer, start_iteration, writer)
+    train(device, envs, model, actor_optimizer, critic_optimizer, start_iteration, writer, replay_buffer)
     print("Finished training")
 
     envs.close()

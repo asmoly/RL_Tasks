@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
-from tensordict.nn.distributions import NormalParamExtractor
-from tensordict.nn import TensorDictModule
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
+from torchrl.modules import TanhNormal
 
 class SAC(nn.Module):
     def __init__(self, input_channels=4, action_dim=3):
@@ -53,17 +51,4 @@ class SAC(nn.Module):
         dist = TanhNormal(mean, std)
         
         return dist
-
-    def forward(self, obs):
-        dist = self.get_action_dist(obs) # Get the output distribution
-    
-        # Sample form the distribution
-        # The rsample function allows you to sample from the distribution while still keeping gradients because just .sample() wipes the gradients
-        # The formula for rsample is action = mean + std*epsilon with epsilon being some noise/randomness
-        action = dist.rsample() 
-        
-        # This returns how likely the model was to choose the action based on how wide the distribution is
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        
-        return action, log_prob
         
