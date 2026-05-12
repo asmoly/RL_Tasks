@@ -6,19 +6,19 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import PPO
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_95.pth"
+PATH_TO_MODEL = "saves\ppo_car_racing_iter_630.pth"
 SAVE_FREQUENCY = 5
 PATH_TO_LOGS = "runs/ppo_car_racing_v4"
 
 TOTAL_ITERATIONS = 2000
-ROLLOUT_STEPS = 2048
+ROLLOUT_STEPS = 4096
 MINI_BATCH_SIZE = 512
 EPOCHS = 10
-LR = 1e-4
+LR = 5e-5 # Increase at start of training to 1e-4
 
-EPSILON = 0.2
+EPSILON = 0.1 # Make 0.1 at the start of training
 CRITIC_WEIGHT = 0.5
-ENTROPY_WEIGHT = 0.01
+ENTROPY_WEIGHT = 0.005 # Make 0.01 at start of training
 
 # Saves model, as well as parameteres
 def save_ppo_model(model, optimizer, iteration, name="ppo_car_racing"):
@@ -51,6 +51,7 @@ def load_ppo_model(model, optimizer, filename, device):
     else:
         print(f"No checkpoint found at {filename}")
         return 0
+
 
 
 def initialize_device():
