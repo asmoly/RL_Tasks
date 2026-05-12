@@ -1,8 +1,8 @@
 import torch
 import os
-import torch.optim as optim
 import gymnasium as gym
 from torch.utils.tensorboard import SummaryWriter
+import numpy as np
 
 from model import SAC
 from replay_buffer import ReplayBuffer
@@ -18,43 +18,42 @@ LAMBDA = 0.99
 SAMPLE_BATCH_SIZE = 256
 NUM_WARMUP_STEPS = 1024
 NUM_ITERATIONS = 2000000
+NUM_ENVS = 16
 
-BUFFER_CAPACITY = 1000000
+BUFFER_CAPACITY = 100000
 STATE_SHAPE = (4, 96, 96)
 ACTION_DIM = 3
 
 # Saves model, as well as parameteres
-def save_model(model, optimizer, iteration, name="ppo_car_racing"):
+def save_model(model, actor_opt, critic_opt, alpha_opt, log_alpha, iteration, name="sac_car_racing"):
     if not os.path.exists("saves"):
         os.makedirs("saves")
-        
+
     filename = f"saves/{name}_iter_{iteration}.pth"
-    
     checkpoint = {
         "iteration": iteration,
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "actor_opt_state_dict": actor_opt.state_dict(),
+        "critic_opt_state_dict": critic_opt.state_dict(),
+        "alpha_opt_state_dict": alpha_opt.state_dict(),
+        "log_alpha": log_alpha
     }
-    
+
     torch.save(checkpoint, filename)
     print(f"Model saved to {filename}")
 
-def load_model(model, optimizer, filename, device):
+def load_model(model, actor_opt, critic_opt, alpha_opt, filename, device):
     if os.path.exists(filename):
         checkpoint = torch.load(filename, map_location=device)
-        
-        model.load_state_dict(checkpoint["model_state_dict"]) # Resores weights
-        
-        # Restore the optimizer state
-        if optimizer is not None:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            
-        print(f"Successfully loaded checkpoint: {filename} (Iteration {checkpoint['iteration']})")
-        return checkpoint["iteration"]
-    else:
-        print(f"No checkpoint found at {filename}")
-        return 0
-
+        model.load_state_dict(checkpoint["model_state_dict"])
+        actor_opt.load_state_dict(checkpoint["actor_opt_state_dict"])
+        critic_opt.load_state_dict(checkpoint["critic_opt_state_dict"])
+        alpha_opt.load_state_dict(checkpoint["alpha_opt_state_dict"])
+        log_alpha = checkpoint["log_alpha"].to(device)
+        print(f"Loaded checkpoint: {filename}")
+        return checkpoint["iteration"], log_alpha
+    
+    return 0, torch.zeros(1, requires_grad=True, device=device)
 
 def initialize_device():
     try:
@@ -77,7 +76,7 @@ def make_env():
     return env
 
 # Creates a specific amount of environments in parrallel
-def initialize_env(num_envs=16):
+def initialize_env(num_envs=NUM_ENVS):
     envs = gym.vector.AsyncVectorEnv([make_env for _ in range(num_envs)])
     return envs
 
@@ -104,31 +103,52 @@ def initialize_optimizer(model):
     return actor_optimizer, critic_optimizer
 
 def buffer_step(device, envs, model, replay_buffer, current_obs):
-    action, log_prob = model.forward(current_obs)
-    action[:, 1:] = (action[:, 1:] + 1)/2 # This shrinks the throttle and brake to a range of 0 and 1
-
-    next_obs, reward, terminated, truncated, info = envs.step(action)
-    next_obs = torch.from_numpy(current_obs).to(device).float()
+    with torch.no_grad():
+        action, _ = model.forward(current_obs) # Normalizes internally
     
-    replay_buffer.add(current_obs, action, reward, next_obs, terminated or truncated) # Adds the step to the buffer
+    action_np = action.cpu().numpy()
+    action_np[:, 1:] = (action_np[:, 1:] + 1)/2  # Scale gas [1] and brake [2] from [-1, 1] to [0, 1]
 
-    if terminated or truncated:
-        next_obs, _ = envs.reset()
-        next_obs = torch.from_numpy(current_obs).to(device).float()
+    next_obs_np, reward, terminated, truncated, info = envs.step(action_np)
+    dones = terminated | truncated 
 
-    return next_obs
+    scaled_reward = reward * 0.1  # Normalize reward
 
-def train(device, envs, model, actor_optimizer, critic_optimizer, start_iteration, writer, replay_buffer):
+    for i in range(current_obs.shape[0]):
+        # Fix 2: Handle Auto-Reset observations
+        # If an env is 'done', gymnasium puts the new start frame in next_obs_np.
+        # We need the 'final_observation' to save the actual last frame of the crash/finish.
+        if dones[i] and "final_observation" in info:
+            real_next_obs = info["final_observation"][i]
+        else:
+            real_next_obs = next_obs_np[i]
+
+        replay_buffer.add(
+            current_obs[i].cpu().numpy(), # Store as uint8 if possible to save RAM
+            action_np[i], 
+            scaled_reward[i], 
+            real_next_obs, 
+            dones[i]
+        )
+
+    return torch.from_numpy(next_obs_np).to(device).float()
+
+
+def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay_buffer):
+    # This sets up the auto alpha (just the weight for log probability, it also gets optimized)
+    target_entropy = -ACTION_DIM 
+    log_alpha = torch.zeros(1, requires_grad=True, device=device)
+    alpha_optimizer = torch.optim.Adam([log_alpha], lr=LR)
+    
+    start_iteration = 0
+    if PATH_TO_MODEL != None:
+        start_iteration = load_model(model, actor_optimizer, critic_optimizer, alpha_optimizer, PATH_TO_MODEL, device)
+    
     # 1. Create a Target Model (Physical copy for stable targets)
     from copy import deepcopy
     target_model = deepcopy(model).to(device)
     for p in target_model.parameters():
         p.requires_grad = False  # Target networks never learn via gradients
-    
-    # This sets up the auto alpha (just the weight for log probability, it also gets optimized)
-    target_entropy = -ACTION_DIM 
-    log_alpha = torch.zeros(1, requires_grad=True, device=device)
-    alpha_optimizer = torch.optim.Adam([log_alpha], lr=LR)
     
     # Reseting environment and converting to tensor
     obs, _ = envs.reset()
@@ -139,91 +159,102 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, start_iteratio
     for i in range(0, NUM_WARMUP_STEPS):
         obs = buffer_step(device, envs, model, replay_buffer, obs)
 
-    for iteration in range(0, NUM_ITERATIONS):
+    for iteration in range(start_iteration + 1, NUM_ITERATIONS):
         obs = buffer_step(device, envs, model, replay_buffer, obs) # Take one step and add to buffer
         
-        states, actions, rewards, next_states, dones = replay_buffer.sample(SAMPLE_BATCH_SIZE) # Get sample batch
-        
-        # Converts rewards and dones to tensors
-        rewards = torch.FloatTensor(rewards).to(device)
-        dones = torch.FloatTensor(dones).to(device)
+        for i in range (0, NUM_ENVS):
+            states, actions, rewards, next_states, dones = replay_buffer.sample(SAMPLE_BATCH_SIZE)
+            states = torch.FloatTensor(states).to(device)
+            actions = torch.FloatTensor(actions).to(device)
+            next_states = torch.FloatTensor(next_states).to(device)
 
-        alpha = log_alpha.exp() # Get the current alpha value
+            # Converts rewards and dones to tensors
+            rewards = torch.FloatTensor(rewards).to(device).view(-1, 1)
+            dones = torch.FloatTensor(dones).to(device).view(-1, 1)
 
-        with torch.no_grad():
-            # Get the actions and log probs from inputting next_states into the model
-            next_dist = model.get_action_dist(next_states) # Get distribution
-            next_actions = next_dist.rsample() # Sample from dist (rsample keeps gradients)
-            next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True) # Gets the log prob from the dsitribution base don how wide it is
+            alpha = log_alpha.exp() # Get the current alpha value
 
-            # Encodes the next states using the CNN
-            next_states_encoded = target_model.encoder(next_states/255.0)
+            with torch.no_grad():
+                # Get the actions and log probs from inputting next_states into the model
+                next_dist = model.get_action_dist(next_states) # Get distribution
+                next_actions = next_dist.rsample() # Sample from dist (rsample keeps gradients)
+                next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True) # Gets the log prob from the dsitribution base don how wide it is
 
-            # Gets the critic values for the concatinated encoded states and their corresponding actions
-            next_critic_a_out = target_model.critic_a(torch.cat([next_states_encoded, next_actions], dim=-1))
-            next_critic_b_out = target_model.critic_b(torch.cat([next_states_encoded, next_actions], dim=-1))
+                # Encodes the next states using the CNN
+                next_states_encoded = target_model.encoder(next_states/255.0)
 
-            target = torch.min(next_critic_a_out, next_critic_b_out) - alpha*next_log_prob
+                # Gets the critic values for the concatinated encoded states and their corresponding actions
+                next_critic_a_out = target_model.critic_a(torch.cat([next_states_encoded, next_actions], dim=-1))
+                next_critic_b_out = target_model.critic_b(torch.cat([next_states_encoded, next_actions], dim=-1))
+
+                target = torch.min(next_critic_a_out, next_critic_b_out) - alpha*next_log_prob
+                
+                # (1 - dones) is used for the mask, it is 1 when the episode is done, so we do 1 - target so that when its done weights go to 0
+                # The rest of the formula is just the standard loss function
+                target = rewards + (1 - dones)*LAMBDA*target
+
+
+            curr_states_encoded = model.encoder(states/255.0)
+            curr_critic_a_out = model.critic_a(torch.cat([curr_states_encoded, actions], dim=-1))
+            curr_critic_b_out = model.critic_b(torch.cat([curr_states_encoded, actions], dim=-1))
             
-            # (1 - dones) is used for the mask, it is 1 when the episode is done, so we do 1 - target so that when its done weights go to 0
-            # The rest of the formula is just the standard loss function
-            target = rewards + (1 - dones)*LAMBDA*target
+            critic_a_loss = 0.5 * (curr_critic_a_out - target).pow(2).mean()
+            critic_b_loss = 0.5 * (curr_critic_b_out - target).pow(2).mean()
 
+            critic_loss = critic_a_loss + critic_b_loss
 
-        curr_states_encoded = model.encoder(states/255.0)
-        curr_critic_a_out = model.critic_a(torch.cat([curr_states_encoded, actions], dim=-1))
-        curr_critic_b_out = model.critic_b(torch.cat([curr_states_encoded, actions], dim=-1))
-        
-        critic_a_loss = 0.5(curr_critic_a_out - target)**2
-        critic_b_loss = 0.5(curr_critic_b_out - target)**2
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Makes sure gradients aren't too big
 
-        critic_loss = critic_a_loss + critic_b_loss
+            # Optimize the critic models
+            critic_optimizer.zero_grad()
+            critic_loss.backward()
+            critic_optimizer.step()
 
-        # Optimize the critic models
-        critic_optimizer.zero_grad()
-        critic_loss.backward()
-        critic_optimizer.step()
+            # CRITIC OPTIMIZATION DONE
+            # MOVING ON TO ACTOR
 
-        # CRITIC OPTIMIZATION DONE
-        # MOVING ON TO ACTOR
+            # Get the distribution for the current state
+            dist = model.get_action_dist(states)
+            new_actions = dist.rsample() # Get new actions form the distribution
+            new_log_prob = dist.log_prob(new_actions).sum(-1, keepdim=True) # And the log prob
 
-        # Get the distribution for the current state
-        dist = model.get_action_dist(states)
-        new_actions = dist.rsample() # Get new actions form the distribution
-        new_log_prob = dist.log_prob(new_actions).sum(-1, keepdim=True) # And the log prob
+            actor_curr_states_encoded = model.encoder(states/255.0) # Encodes the current states (we re encode so gradients flow to the actor, not the critic)
+            
+            # Gets the critic outputs from the encoded states
+            actor_curr_critic_a_out = model.critic_a(torch.cat([actor_curr_states_encoded, new_actions], dim=-1))
+            actor_curr_critic_b_out = model.critic_b(torch.cat([actor_curr_states_encoded, new_actions], dim=-1))
+            
+            # Calculates the loss function
+            actor_loss = (alpha.detach()*new_log_prob - torch.min(actor_curr_critic_a_out, actor_curr_critic_b_out)).mean()
 
-        actor_curr_states_encoded = model.encoder(states/255.0) # Encodes the current states (we re encode so gradients flow to the actor, not the critic)
-        
-        # Gets the critic outputs from the encoded states
-        actor_curr_critic_a_out = model.critic_a(torch.cat([actor_curr_states_encoded, new_actions], dim=-1))
-        actor_curr_critic_b_out = model.critic_b(torch.cat([actor_curr_states_encoded, new_actions], dim=-1))
-        
-        # Calculates the loss function
-        actor_loss = (alpha.detach()*new_log_prob - torch.min(actor_curr_critic_a_out, actor_curr_critic_b_out)).mean()
+            # Optimizes the actor
+            actor_optimizer.zero_grad()
+            actor_loss.backward()
+            actor_optimizer.step()
 
-        # Optimizes the actor
-        actor_optimizer.zero_grad()
-        actor_loss.backward()
-        actor_optimizer.step()
+            # Optimizes the alpha variable
+            alpha_loss = -(log_alpha*(new_log_prob + target_entropy).detach()).mean() # Loss for alpha (Looks like it is just optimizing towards randomness)
+            alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            alpha_optimizer.step()
 
-        # Optimizes the alpha variable
-        alpha_loss = -(log_alpha*(new_log_prob + target_entropy).detach()).mean() # Loss for alpha (Looks like it is just optimizing towards randomness)
-        alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        alpha_optimizer.step()
-
-        # This nudges the target model towards the live model
-        # If we just used the live model it would basically learn to reward itself because the loss isn't too grounded in the actual reward
-        # So we have a stable target model which laggs behind and the live model learns from it
-        with torch.no_grad():
-            for p, p_t in zip(model.parameters(), target_model.parameters()):
-                p_t.data.copy_(TAU * p.data + (1 - TAU) * p_t.data)
+            # This nudges the target model towards the live model
+            # If we just used the live model it would basically learn to reward itself because the loss isn't too grounded in the actual reward
+            # So we have a stable target model which laggs behind and the live model learns from it
+            with torch.no_grad():
+                for p, p_t in zip(model.parameters(), target_model.parameters()):
+                    p_t.data.copy_(TAU * p.data + (1 - TAU) * p_t.data)
 
         # Tensorboard logging
-        if iteration % 100 == 0:
+        if iteration % 1 == 0:
             writer.add_scalar("Loss/Actor", actor_loss.item(), iteration)
             writer.add_scalar("Loss/Critic", critic_loss.item(), iteration)
             writer.add_scalar("Alpha", alpha.item(), iteration)
+
+            print(f"Iteration: {iteration}, Actor Loss: {actor_loss.item()}, Critic Loss: {critic_loss.item()}, Alpha: {alpha.item()}")
+
+        if iteration % 1000 == 0:
+            save_model(model, actor_optimizer, critic_optimizer, alpha_optimizer, log_alpha, iteration)
 
 
 
@@ -236,15 +267,10 @@ def main():
 
     model = initialize_model(device)
     actor_optimizer, critic_optimizer = initialize_optimizer(model)
-
-    start_iteration = 0
-    if PATH_TO_MODEL != None:
-        start_iteration = load_model(model, optimizer, PATH_TO_MODEL, device)
-
     print("Initialized variables")
 
     print("Beggining training")
-    train(device, envs, model, actor_optimizer, critic_optimizer, start_iteration, writer, replay_buffer)
+    train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay_buffer)
     print("Finished training")
 
     envs.close()

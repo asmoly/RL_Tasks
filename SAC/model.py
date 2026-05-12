@@ -40,7 +40,7 @@ class SAC(nn.Module):
         features = self.encoder(obs/255.0)
         
         # Gets the mean and logstd for the distribution from the models
-        mean = self.actor_mean(features) 
+        mean = self.action_mean(features) 
         log_std = self.actor_log_std_head(features)
 
         log_std = torch.clamp(log_std, -20, 2) # Stability trick from the paper
@@ -51,4 +51,17 @@ class SAC(nn.Module):
         dist = TanhNormal(mean, std)
         
         return dist
+
+    def forward(self, obs):
+        dist = self.get_action_dist(obs) # Get the output distribution
+    
+        # Sample form the distribution
+        # The rsample function allows you to sample from the distribution while still keeping gradients because just .sample() wipes the gradients
+        # The formula for rsample is action = mean + std*epsilon with epsilon being some noise/randomness
+        action = dist.rsample() 
+        
+        # This returns how likely the model was to choose the action based on how wide the distribution is
+        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
+        
+        return action, log_prob
         
