@@ -4,7 +4,7 @@ from tensordict.nn.distributions import NormalParamExtractor
 from tensordict.nn import TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 
-class PPO(nn.Module):
+class SAC(nn.Module):
     def __init__(self, input_channels=4, action_dim=3):
         super().__init__()
         
@@ -21,35 +21,49 @@ class PPO(nn.Module):
         )
 
         # self.actor_mean = nn.Linear(512, action_dim) # Mean outputs the actual predicted value for each action
-        self.steering_mean = nn.Linear(512, 1) # Range: [-1, 1]
-        self.throttle_mean = nn.Linear(512, 2) # Range: [0, 1] (Gas and Brake)
+        self.action_mean = nn.Linear(512, action_dim)
 
         # This initializes the biases for the throttle and brake so that the car initialy presses teh gas, and doesn't press the brake
         with torch.no_grad():
-            self.throttle_mean.bias[0] = 2.0 # 2 run through sigmoid is about 0.88 which is a good initial gas value
-            self.throttle_mean.bias[1] = -2.0 # This initializes teh breaks to a negative bias so it doesn't just brake
+            self.action_mean.bias[1] = 2.0 # 2 run through sigmoid is about 0.88 which is a good initial gas value
+            self.action_mean.bias[2] = -2.0 # This initializes teh breaks to a negative bias so it doesn't just brake
 
-        self.actor_log_std = nn.Parameter(torch.full((1, action_dim), -0.5)) # std is the confidence of the action, lower means higher confidence
+        self.actor_log_std_head = nn.Linear(512, action_dim)  # std is the confidence of the action, lower means higher confidence
         # Action is later sampled using a normal distribution from the mean and the std 
         # Also it is predicting the log of the std, later we take the exp(log(std)) which garantues it to be positive
-        # It is initialized with a tensor [[0, 0, 0]] becaue e^0 = 1 so the std will start at 1
 
         # 4. CRITIC HEAD (Outputs state value V(s))
-        self.critic = nn.Linear(512, 1) # Critic predicts expected reward from current frame until the end of the episode
+        self.critic_a = nn.Linear(512 + action_dim, 1) # Critic predicts expected reward from current frame until the end of the episode
+        self.critic_b = nn.Linear(512 + action_dim, 1)
+        # We have two critics in the SAC algorithm because we want to take the min of them to prevent over optimisitc predictions
+        # It takes in the image features as well as teh action
+
+    def get_action_dist(self, obs):
+        features = self.encoder(obs/255.0)
+        
+        # Gets the mean and logstd for the distribution from the models
+        mean = self.actor_mean(features) 
+        log_std = self.actor_log_std_head(features)
+
+        log_std = torch.clamp(log_std, -20, 2) # Stability trick from the paper
+        std = torch.exp(log_std) # Since we are predicting log(std) we do e^prediction to get just the std
+
+        # This will shrink our distribution to -1 to 1
+        # (Don't forget to later convert gas and brake to 0 to 1 using (throttle/brake + 1)/2 )
+        dist = TanhNormal(mean, std)
+        
+        return dist
 
     def forward(self, obs):
-        features = self.encoder(obs/255.0) # Normalize pixel values
+        dist = self.get_action_dist(obs) # Get the output distribution
+    
+        # Sample form the distribution
+        # The rsample function allows you to sample from the distribution while still keeping gradients because just .sample() wipes the gradients
+        # The formula for rsample is action = mean + std*epsilon with epsilon being some noise/randomness
+        action = dist.rsample() 
         
-        # mean = self.actor_mean(features) # Get mean from actor
-        steer = torch.tanh(self.steering_mean(features)) # tanh making it -1 to 1
-        throttle = torch.sigmoid(self.throttle_mean(features)) # sigmoid makes it 0 to 1
+        # This returns how likely the model was to choose the action based on how wide the distribution is
+        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
         
-        mean = torch.cat([steer, throttle], dim=-1) # Concatinates the two heads
-
-        std = torch.exp(self.actor_log_std).expand_as(mean) # Does e^(log(std)) to get the std, when expanding the [1, 3] std to the batch dimension of the mean
-        
-        # Gets the predicted reward from the critic
-        value = self.critic(features)
-        
-        return mean, std, value
+        return action, log_prob
         
