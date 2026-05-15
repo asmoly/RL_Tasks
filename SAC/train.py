@@ -7,20 +7,20 @@ import numpy as np
 from model import SAC
 from replay_buffer import ReplayBuffer
 
-PATH_TO_MODEL = None
-SAVE_FREQUENCY = 5
-PATH_TO_LOGS = "runs/sac_car_racing_v1"
+PATH_TO_MODEL = "saves\sac_car_racing_iter_69000.pth"
+PATH_TO_LOGS = "runs/sac_car_racing_v2"
 
 LR = 1e-4
+SAVE_FREQUENCY = 500
 
 LAMBDA = 0.99
 
 SAMPLE_BATCH_SIZE = 256
-NUM_WARMUP_STEPS = 1024
+NUM_WARMUP_STEPS = 2056
 NUM_ITERATIONS = 2000000
 NUM_ENVS = 16
 
-BUFFER_CAPACITY = 100000
+BUFFER_CAPACITY = 120000
 STATE_SHAPE = (4, 96, 96)
 ACTION_DIM = 3
 
@@ -51,16 +51,12 @@ def load_model(model, actor_opt, critic_opt, alpha_opt, filename, device):
         alpha_opt.load_state_dict(checkpoint["alpha_opt_state_dict"])
         log_alpha = checkpoint["log_alpha"].to(device)
         print(f"Loaded checkpoint: {filename}")
-        return checkpoint["iteration"], log_alpha
+        return checkpoint["iteration"]
     
     return 0, torch.zeros(1, requires_grad=True, device=device)
 
 def initialize_device():
-    try:
-        device = torch.device(0)
-    except:
-        device = torch.device("cpu")
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     return device
 
@@ -95,6 +91,7 @@ def initialize_optimizer(model):
 
     # This optimizer is for the two critics
     critic_optimizer = torch.optim.Adam(
+        list(model.encoder.parameters()) +
         list(model.critic_a.parameters()) + 
         list(model.critic_b.parameters()), 
         lr=LR
@@ -162,7 +159,7 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
     for iteration in range(start_iteration + 1, NUM_ITERATIONS):
         obs = buffer_step(device, envs, model, replay_buffer, obs) # Take one step and add to buffer
         
-        for i in range (0, NUM_ENVS):
+        for i in range (0, 1):
             states, actions, rewards, next_states, dones = replay_buffer.sample(SAMPLE_BATCH_SIZE)
             states = torch.FloatTensor(states).to(device)
             actions = torch.FloatTensor(actions).to(device)
@@ -253,7 +250,7 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
 
             print(f"Iteration: {iteration}, Actor Loss: {actor_loss.item()}, Critic Loss: {critic_loss.item()}, Alpha: {alpha.item()}")
 
-        if iteration % 1000 == 0:
+        if iteration % SAVE_FREQUENCY == 0:
             save_model(model, actor_optimizer, critic_optimizer, alpha_optimizer, log_alpha, iteration)
 
 

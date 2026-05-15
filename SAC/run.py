@@ -4,7 +4,7 @@ import os
 
 from train import initialize_device, initialize_model
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_1625.pth"
+PATH_TO_MODEL = "saves\sac_car_racing_iter_40000.pth"
 
 def initialize_run_env():
     env = gym.make("CarRacing-v3", continuous=True, render_mode="human")
@@ -46,10 +46,11 @@ def main():
             
             # Get action from model
             # We use the 'mean' for evaluation to get the 'best' behavior
-            mean, std, _ = model(obs_tensor)
+            mean, std = model(obs_tensor)
             
             # Clip for safety and move to CPU
             action = torch.clamp(mean, -1, 1).cpu().numpy()[0]
+            action[1:] = (action[1:] + 1)/2
 
         # Step the environment
         obs, reward, terminated, truncated, info = env.step(action)
