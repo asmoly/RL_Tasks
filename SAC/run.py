@@ -38,25 +38,21 @@ def main():
 
     print("Starting run")
     while not done:
-        # Preprocess the observation exactly like training
-        # (N, H, W, C) -> (1, C, H, W) and normalize
         with torch.no_grad():
-            obs_tensor = torch.from_numpy(obs).to(device).float() # Converts to tensor (C, H, W)
-            obs_tensor = obs_tensor.unsqueeze(0) # Adds a batch dimension (1, C, H, W)
-            
-            # Get action from model
-            # We use the 'mean' for evaluation to get the 'best' behavior
-            mean, std = model(obs_tensor)
-            
-            # Clip for safety and move to CPU
-            action = torch.clamp(mean, -1, 1).cpu().numpy()[0]
-            action[1:] = (action[1:] + 1)/2
+            obs_tensor = torch.from_numpy(obs).to(device).float().unsqueeze(0)
 
-        # Step the environment
+            # Deterministic eval: use the squashed mean of the policy.
+            mean_action = model.get_mean_action(obs_tensor)
+
+            action = mean_action.cpu().numpy()[0]
+            # Same gas/brake remap from [-1, 1] to [0, 1] as in training.
+            action[1:] = (action[1:] + 1) / 2
+
         obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
         done = terminated or truncated
 
-    print(f"Episode Finished")
+    print(f"Episode Finished — total reward: {total_reward:.2f}")
     env.close()
 
 if __name__ == "__main__":

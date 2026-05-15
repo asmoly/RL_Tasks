@@ -18,7 +18,6 @@ class SAC(nn.Module):
             nn.ReLU()
         )
 
-        # self.actor_mean = nn.Linear(512, action_dim) # Mean outputs the actual predicted value for each action
         self.action_mean = nn.Linear(512, action_dim)
 
         # This initializes the biases for the throttle and brake so that the car initialy presses teh gas, and doesn't press the brake
@@ -30,14 +29,16 @@ class SAC(nn.Module):
         # Action is later sampled using a normal distribution from the mean and the std 
         # Also it is predicting the log of the std, later we take the exp(log(std)) which garantues it to be positive
 
-        # 4. CRITIC HEAD (Outputs state value V(s))
         self.critic_a = nn.Linear(512 + action_dim, 1) # Critic predicts expected reward from current frame until the end of the episode
         self.critic_b = nn.Linear(512 + action_dim, 1)
         # We have two critics in the SAC algorithm because we want to take the min of them to prevent over optimisitc predictions
         # It takes in the image features as well as teh action
 
-    def get_action_dist(self, obs):
+    def get_action_dist(self, obs, detach_encoder=False):
         features = self.encoder(obs/255.0)
+        
+        if detach_encoder: # This is used for the actor update since we don't want to optimize the encoder
+            features = features.detach()
         
         # Gets the mean and logstd for the distribution from the models
         mean = self.action_mean(features) 
@@ -64,4 +65,10 @@ class SAC(nn.Module):
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
         
         return action, log_prob
+
+    # Used in run script to just run the encoder and action to get a value
+    def get_mean_action(self, obs):
+        features = self.encoder(obs/255.0)
+        mean = self.action_mean(features)
+        return torch.tanh(mean)
         
