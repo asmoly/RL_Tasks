@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from torchrl.modules import TanhNormal
+from torch.distributions import Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
 
 class SAC(nn.Module):
     def __init__(self, input_channels=4, action_dim=3):
@@ -19,11 +20,6 @@ class SAC(nn.Module):
         )
 
         self.action_mean = nn.Linear(512, action_dim)
-
-        # This initializes the biases for the throttle and brake so that the car initialy presses teh gas, and doesn't press the brake
-        with torch.no_grad():
-            self.action_mean.bias[1] = 2.0 # 2 run through sigmoid is about 0.88 which is a good initial gas value
-            self.action_mean.bias[2] = -2.0 # This initializes teh breaks to a negative bias so it doesn't just brake
 
         self.actor_log_std_head = nn.Linear(512, action_dim)  # std is the confidence of the action, lower means higher confidence
         # Action is later sampled using a normal distribution from the mean and the std 
@@ -44,13 +40,12 @@ class SAC(nn.Module):
         mean = self.action_mean(features) 
         log_std = self.actor_log_std_head(features)
 
-        log_std = torch.clamp(log_std, -20, 2) # Stability trick from the paper
+        log_std = torch.clamp(log_std, -5, 2) # Tightens the log prob for stability
         std = torch.exp(log_std) # Since we are predicting log(std) we do e^prediction to get just the std
 
-        # This will shrink our distribution to -1 to 1
-        # (Don't forget to later convert gas and brake to 0 to 1 using (throttle/brake + 1)/2 )
-        dist = TanhNormal(mean, std)
-        
+        base_dist = Normal(mean, std) # This first gets the un normalized distribution
+        dist = TransformedDistribution(base_dist, [TanhTransform(cache_size=1)]) # Normalizes the dist using TanhTransform (Prevents critic from going to inf)
+
         return dist
 
     def forward(self, obs):
