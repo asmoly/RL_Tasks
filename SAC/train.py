@@ -8,17 +8,17 @@ from model import SAC
 from replay_buffer import ReplayBuffer
 
 PATH_TO_MODEL = None  # Set to a checkpoint path (e.g. "saves/sac_car_racing_iter_69000.pth") to resume
-PATH_TO_LOGS = "runs/sac_car_racing_v2"
+PATH_TO_LOGS = "runs/sac_car_racing_v4"
 
 LR = 1e-4
-SAVE_FREQUENCY = 500
+SAVE_FREQUENCY = 1000
 
 LAMBDA = 0.99
 TAU = 0.005 # Soft update coefficient
 
 SAMPLE_BATCH_SIZE = 256
 NUM_WARMUP_STEPS = 2056
-NUM_ITERATIONS = 2000000
+NUM_ITERATIONS = 4000000
 NUM_ENVS = 16
 
 BUFFER_CAPACITY = 120000
@@ -289,6 +289,7 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
         writer.add_scalar("Alpha", alpha.item(), iteration)
 
         if iteration % 100 == 0:
+            writer.flush() # Force scalars onto disk so TensorBoard can see them in near-realtime on Windows
             print(
                 f"Iteration: {iteration}, "
                 f"Actor Loss: {actor_loss.item():.4f}, "
