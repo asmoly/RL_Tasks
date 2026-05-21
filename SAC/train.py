@@ -1,3 +1,4 @@
+import math
 import torch
 import os
 import gymnasium as gym
@@ -7,8 +8,8 @@ import numpy as np
 from model import SAC
 from replay_buffer import ReplayBuffer
 
-PATH_TO_MODEL = None  # Set to a checkpoint path (e.g. "saves/sac_car_racing_iter_69000.pth") to resume
-PATH_TO_LOGS = "runs/sac_car_racing_v4"
+PATH_TO_MODEL = "saves\sac_car_racing_iter_72000.pth"
+PATH_TO_LOGS = "runs/sac_car_racing_v1"
 
 LR = 1e-4
 SAVE_FREQUENCY = 1000
@@ -16,7 +17,7 @@ SAVE_FREQUENCY = 1000
 LAMBDA = 0.99
 TAU = 0.005 # Soft update coefficient
 
-SAMPLE_BATCH_SIZE = 256
+SAMPLE_BATCH_SIZE = 512
 NUM_WARMUP_STEPS = 2056
 NUM_ITERATIONS = 4000000
 NUM_ENVS = 16
@@ -24,6 +25,11 @@ NUM_ENVS = 16
 BUFFER_CAPACITY = 120000
 STATE_SHAPE = (4, 96, 96)
 ACTION_DIM = 3
+
+# This is what we want the entropy to be
+TARGET_ENTROPY = 1.0
+# This is a hard floor for alpha since we want to keep some exploration alive
+MIN_ALPHA = 0.2
 
 # Saves model, as well as parameteres
 def save_model(model, actor_opt, critic_opt, alpha_opt, log_alpha, iteration, name="sac_car_racing"):
@@ -162,7 +168,7 @@ def buffer_step(device, envs, model, replay_buffer, current_obs):
 
 
 def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay_buffer):
-    target_entropy = -ACTION_DIM # This is wat we want our entropy to be
+    target_entropy = TARGET_ENTROPY # This is wat we want our entropy to be
     log_alpha = torch.zeros(1, requires_grad=True, device=device) # Initializes log alpha so that it is differentiable
 
     # Loads the model and gets the start iteration
@@ -276,6 +282,10 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
         alpha_optimizer.zero_grad()
         alpha_loss.backward()
         alpha_optimizer.step()
+        # Floor on log_alpha so alpha never decays below MIN_ALPHA. Without this the
+        # auto-alpha update will happily push alpha to ~0 and the policy collapses.
+        with torch.no_grad():
+            log_alpha.clamp_(min=math.log(MIN_ALPHA))
 
         # This will move the target model towards the live model at a rate of TAU
         with torch.no_grad():

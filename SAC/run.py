@@ -4,7 +4,12 @@ import os
 
 from train import initialize_device, initialize_model
 
-PATH_TO_MODEL = "saves\sac_car_racing_iter_40000.pth"
+PATH_TO_MODEL = "saves\sac_car_racing_iter_1000.pth"
+# If True, sample actions from the policy distribution (matches training-time behavior).
+# If False, use tanh(action_mean) deterministically. With a high-entropy policy the
+# stochastic version often reveals what the policy *actually* learned — the mean of a
+# noisy policy can correspond to "do nothing" while samples are reasonable behaviors.
+STOCHASTIC = True
 
 def initialize_run_env():
     env = gym.make("CarRacing-v3", continuous=True, render_mode="human")
@@ -41,10 +46,14 @@ def main():
         with torch.no_grad():
             obs_tensor = torch.from_numpy(obs).to(device).float().unsqueeze(0)
 
-            # Deterministic eval: use the squashed mean of the policy.
-            mean_action = model.get_mean_action(obs_tensor)
+            if STOCHASTIC:
+                # Sample from the policy — matches training-time behavior.
+                action_tensor, _ = model.forward(obs_tensor)
+            else:
+                # Deterministic: tanh(action_mean).
+                action_tensor = model.get_mean_action(obs_tensor)
 
-            action = mean_action.cpu().numpy()[0]
+            action = action_tensor.cpu().numpy()[0]
             # Same gas/brake remap from [-1, 1] to [0, 1] as in training.
             action[1:] = (action[1:] + 1) / 2
 

@@ -23,8 +23,8 @@ class SAC(nn.Module):
 
         # Initialize the biases of the throttle and brake so the model begins by driving forwar and not braking
         with torch.no_grad():
-            self.action_mean.bias[1] = 1.0   # gas
-            self.action_mean.bias[2] = -1.0  # brake
+            self.action_mean.bias[1] = 2.0   # gas
+            self.action_mean.bias[2] = -2.0  # brake
 
         self.actor_log_std_head = nn.Linear(512, action_dim)  # std is the confidence of the action, lower means higher confidence
         # Action is later sampled using a normal distribution from the mean and the std 
