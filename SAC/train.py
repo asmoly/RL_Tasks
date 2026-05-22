@@ -8,7 +8,7 @@ import numpy as np
 from model import SAC
 from replay_buffer import ReplayBuffer
 
-PATH_TO_MODEL = "saves\sac_car_racing_iter_72000.pth"
+PATH_TO_MODEL = None
 PATH_TO_LOGS = "runs/sac_car_racing_v1"
 
 LR = 1e-4
@@ -27,9 +27,9 @@ STATE_SHAPE = (4, 96, 96)
 ACTION_DIM = 3
 
 # This is what we want the entropy to be
-TARGET_ENTROPY = 1.0
+TARGET_ENTROPY = -1.0
 # This is a hard floor for alpha since we want to keep some exploration alive
-MIN_ALPHA = 0.2
+MIN_ALPHA = 0.1
 
 # Saves model, as well as parameteres
 def save_model(model, actor_opt, critic_opt, alpha_opt, log_alpha, iteration, name="sac_car_racing"):
@@ -79,9 +79,24 @@ def initialize_tensorboard(path_to_logs):
     writer = SummaryWriter(log_dir=path_to_logs)
     return writer
 
+# This is a wrapper for the environment so that it returns the info of the car as well (specifically speed) for reward shaping
+class SpeedInfoWrapper(gym.Wrapper):
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action) # Takes step
+        car = self.env.unwrapped.car # Unwraps the car
+        if car is not None:
+            # Calculates and sets the speed of the car
+            vx, vy = car.hull.linearVelocity[0], car.hull.linearVelocity[1]
+            info["speed"] = float(math.sqrt(vx * vx + vy * vy))
+        else:
+            info["speed"] = 0.0
+
+        return obs, reward, terminated, truncated, info # Extra info variable contaiing speed
+
 # This defines a function on how to create the environemnt
 def make_env():
     env = gym.make("CarRacing-v3", continuous=True) # Continuous=True is important since controls are continuous
+    env = SpeedInfoWrapper(env) # Exposes car speed in info dict for reward shaping
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=False) # Converts to grayscale
     env = gym.wrappers.FrameStackObservation(env, stack_size=4) # Stacks the last 4 frames as channels of the image for history, so the channel dimension is now 4 rather than 3 for rgb 
     return env
@@ -130,7 +145,12 @@ def buffer_step(device, envs, model, replay_buffer, current_obs):
     next_obs_np, reward, terminated, truncated, info = envs.step(env_action)
     dones = terminated | truncated  # This creates an array where every element is terminated[n] or truncated[n]
 
-    scaled_reward = reward*0.1  # Normalize reward
+    # This is the reward shaping
+    # Gets the speed of the car in the batch frames
+    speeds = np.asarray(info.get("speed", np.zeros(current_obs.shape[0])), dtype=np.float32)
+    SPEED_BONUS = 0.05  # This is how much the speed is important
+    shaped_reward = reward + SPEED_BONUS*speeds # Adds the extra speed reward
+    scaled_reward = shaped_reward*0.1  # This is just basic normilization
 
     # Handles when the episode is done, and getting the final observation
     # the reason there are two different versions is because older or newer version of gymnasium
