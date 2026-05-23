@@ -9,7 +9,7 @@ from model import SAC
 from replay_buffer import ReplayBuffer
 
 PATH_TO_MODEL = None
-PATH_TO_LOGS = "runs/sac_car_racing_v1"
+PATH_TO_LOGS = "runs/sac_car_racing_v3"
 
 LR = 1e-4
 SAVE_FREQUENCY = 1000
@@ -276,6 +276,15 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
         torch.nn.utils.clip_grad_norm_(critic_params, 1.0)
         critic_optimizer.step()
 
+        # If the critic loss goes to inifinity it just ends the training
+        if not torch.isfinite(critic_loss):
+            raise RuntimeError(
+                f"Critic loss became non-finite at iteration {iteration}: "
+                f"critic_loss={critic_loss.item()}, target stats=[min={target.min().item():.3g}, "
+                f"max={target.max().item():.3g}, mean={target.mean().item():.3g}], "
+                f"alpha={alpha.item():.3g}"
+            )
+
 
         # This is the actor update
         dist = model.get_action_dist(states, detach_encoder=True) # Get a distribution from the states
@@ -312,13 +321,14 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
             for p, p_t in zip(model.parameters(), target_model.parameters()):
                 p_t.data.mul_(1 - TAU).add_(p.data, alpha=TAU)
 
-        # Log to tensor board
-        writer.add_scalar("Loss/Actor", actor_loss.item(), iteration)
-        writer.add_scalar("Loss/Critic", critic_loss.item(), iteration)
-        writer.add_scalar("Loss/Alpha", alpha_loss.item(), iteration)
-        writer.add_scalar("Alpha", alpha.item(), iteration)
+        # Save model every SAVE_FREQUENCY steps
+        if iteration % SAVE_FREQUENCY == 0:
+            # Log to tensor board
+            writer.add_scalar("Loss/Actor", actor_loss.item(), iteration)
+            writer.add_scalar("Loss/Critic", critic_loss.item(), iteration)
+            writer.add_scalar("Loss/Alpha", alpha_loss.item(), iteration)
+            writer.add_scalar("Alpha", alpha.item(), iteration)
 
-        if iteration % 100 == 0:
             writer.flush() # Force scalars onto disk so TensorBoard can see them in near-realtime on Windows
             print(
                 f"Iteration: {iteration}, "
@@ -327,8 +337,6 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
                 f"Alpha: {alpha.item():.4f}"
             )
 
-        # Save model every SAVE_FREQUENCY steps
-        if iteration % SAVE_FREQUENCY == 0:
             save_model(model, actor_optimizer, critic_optimizer, alpha_optimizer, log_alpha, iteration)
 
 

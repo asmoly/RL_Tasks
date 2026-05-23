@@ -16,6 +16,7 @@ class SAC(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(64*8*8, 512),
+            nn.LayerNorm(512), # Normalizes the output so that critic loss doesn't go to inf
             nn.ReLU()
         )
 
@@ -23,8 +24,8 @@ class SAC(nn.Module):
 
         # Initialize the biases of the throttle and brake so the model begins by driving forwar and not braking
         with torch.no_grad():
-            self.action_mean.bias[1] = 2.0   # gas
-            self.action_mean.bias[2] = -2.0  # brake
+            self.action_mean.bias[1] = 0.5   # gas
+            self.action_mean.bias[2] = -0.5  # brake
 
         self.actor_log_std_head = nn.Linear(512, action_dim)  # std is the confidence of the action, lower means higher confidence
         # Action is later sampled using a normal distribution from the mean and the std 
@@ -45,7 +46,8 @@ class SAC(nn.Module):
         mean = self.action_mean(features) 
         log_std = self.actor_log_std_head(features)
 
-        log_std = torch.clamp(log_std, -5, 2) # Tightens the log prob for stability
+        # Clamp the log_std for normalization purposes
+        log_std = torch.clamp(log_std, -5, 0)
         std = torch.exp(log_std) # Since we are predicting log(std) we do e^prediction to get just the std
 
         base_dist = Normal(mean, std) # This first gets the un normalized distribution
