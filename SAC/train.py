@@ -9,7 +9,7 @@ from model import SAC
 from replay_buffer import ReplayBuffer
 
 PATH_TO_MODEL = None
-PATH_TO_LOGS = "runs/sac_car_racing_v3"
+PATH_TO_LOGS = "runs/sac_car_racing_v4"
 
 LR = 1e-4
 SAVE_FREQUENCY = 1000
@@ -129,7 +129,7 @@ def initialize_optimizer(model):
 
     return actor_optimizer, critic_optimizer
 
-def buffer_step(device, envs, model, replay_buffer, current_obs):
+def buffer_step(device, envs, model, replay_buffer, current_obs, episode_returns=None, episode_lengths=None, finished_episodes=None):
     # Get the predicted action for the observation
     with torch.no_grad():
         action, _ = model.forward(current_obs) # Normalizes internally
@@ -145,10 +145,20 @@ def buffer_step(device, envs, model, replay_buffer, current_obs):
     next_obs_np, reward, terminated, truncated, info = envs.step(env_action)
     dones = terminated | truncated  # This creates an array where every element is terminated[n] or truncated[n]
 
+    # This tracks the episode returns/rewards
+    if episode_returns is not None:
+        episode_returns += reward
+        episode_lengths += 1
+        for i in range(len(dones)):
+            if dones[i]:
+                finished_episodes.append((float(episode_returns[i]), int(episode_lengths[i])))
+                episode_returns[i] = 0.0
+                episode_lengths[i] = 0
+
     # This is the reward shaping
     # Gets the speed of the car in the batch frames
     speeds = np.asarray(info.get("speed", np.zeros(current_obs.shape[0])), dtype=np.float32)
-    SPEED_BONUS = 0.05  # This is how much the speed is important
+    SPEED_BONUS = 0.3
     shaped_reward = reward + SPEED_BONUS*speeds # Adds the extra speed reward
     scaled_reward = shaped_reward*0.1  # This is just basic normilization
 
@@ -213,9 +223,16 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
     obs, _ = envs.reset()
     obs = torch.from_numpy(obs).to(device).float()
 
+    # This creates our matricies to store the episode returns and lengths
+    episode_returns = np.zeros(NUM_ENVS, dtype=np.float64)
+    episode_lengths = np.zeros(NUM_ENVS, dtype=np.int64)
+    finished_episodes = []  # rolling buffer of (return, length) for completed episodes
+
     # Adds some starter data to the buffer
     for i in range(0, NUM_WARMUP_STEPS):
-        obs = buffer_step(device, envs, model, replay_buffer, obs)
+        obs = buffer_step(device, envs, model, replay_buffer, obs, episode_returns, episode_lengths, finished_episodes)
+    # Discard warmup episode stats — we only care about returns during real training.
+    finished_episodes.clear()
     # Creates the parametrs we want to optimize for both optimizers
     actor_params = (
         list(model.action_mean.parameters())
@@ -229,7 +246,7 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
 
     # Loops from start iteration to max iteration
     for iteration in range(start_iteration + 1, NUM_ITERATIONS):
-        obs = buffer_step(device, envs, model, replay_buffer, obs) # Take one step and add to buffer
+        obs = buffer_step(device, envs, model, replay_buffer, obs, episode_returns, episode_lengths, finished_episodes) # Take one step and add to buffer
 
         # Gets a sample from the replay buffer
         states, actions, rewards, next_states, dones = replay_buffer.sample(SAMPLE_BATCH_SIZE)
@@ -329,12 +346,26 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
             writer.add_scalar("Loss/Alpha", alpha_loss.item(), iteration)
             writer.add_scalar("Alpha", alpha.item(), iteration)
 
+            # This logs the episode returns
+            if len(finished_episodes) > 0:
+                returns = np.array([r for r, _ in finished_episodes], dtype=np.float64)
+                lengths = np.array([l for _, l in finished_episodes], dtype=np.float64)
+                writer.add_scalar("Episode/Return_mean", returns.mean(), iteration)
+                writer.add_scalar("Episode/Return_max", returns.max(), iteration)
+                writer.add_scalar("Episode/Length_mean", lengths.mean(), iteration)
+                writer.add_scalar("Episode/Count_in_window", len(returns), iteration)
+                ep_ret_str = f"ep_ret_mean={returns.mean():.2f}, ep_ret_max={returns.max():.2f}, ep_len_mean={lengths.mean():.0f}, ep_count={len(returns)}"
+                finished_episodes.clear()
+            else:
+                ep_ret_str = "no episodes finished in window"
+
             writer.flush() # Force scalars onto disk so TensorBoard can see them in near-realtime on Windows
             print(
                 f"Iteration: {iteration}, "
                 f"Actor Loss: {actor_loss.item():.4f}, "
                 f"Critic Loss: {critic_loss.item():.4f}, "
-                f"Alpha: {alpha.item():.4f}"
+                f"Alpha: {alpha.item():.4f}, "
+                f"{ep_ret_str}"
             )
 
             save_model(model, actor_optimizer, critic_optimizer, alpha_optimizer, log_alpha, iteration)
