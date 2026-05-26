@@ -9,7 +9,7 @@ from model import SAC
 from replay_buffer import ReplayBuffer
 
 PATH_TO_MODEL = None
-PATH_TO_LOGS = "runs/sac_car_racing_v4"
+PATH_TO_LOGS = "runs/sac_car_racing_v8"
 
 LR = 1e-4
 SAVE_FREQUENCY = 1000
@@ -18,7 +18,7 @@ LAMBDA = 0.99
 TAU = 0.005 # Soft update coefficient
 
 SAMPLE_BATCH_SIZE = 512
-NUM_WARMUP_STEPS = 2056
+NUM_WARMUP_STEPS = 1000
 NUM_ITERATIONS = 4000000
 NUM_ENVS = 16
 
@@ -29,7 +29,7 @@ ACTION_DIM = 3
 # This is what we want the entropy to be
 TARGET_ENTROPY = -1.0
 # This is a hard floor for alpha since we want to keep some exploration alive
-MIN_ALPHA = 0.1
+MIN_ALPHA = 0.02
 
 # Saves model, as well as parameteres
 def save_model(model, actor_opt, critic_opt, alpha_opt, log_alpha, iteration, name="sac_car_racing"):
@@ -93,10 +93,39 @@ class SpeedInfoWrapper(gym.Wrapper):
 
         return obs, reward, terminated, truncated, info # Extra info variable contaiing speed
 
+# This is a wrapper for frame skipping
+# basically one action will last the specified frames
+# this is because usually just one frame is too little to actually tell the difference
+# in velocity, rotation, etc..
+class FrameSkip(gym.Wrapper):
+    def __init__(self, env, skip=4):
+        super().__init__(env)
+        self._skip = skip
+
+    def step(self, action):
+        total_reward = 0.0
+        total_speed = 0.0
+        n = 0
+        terminated = truncated = False
+        info = {}
+        last_obs = None
+        for _ in range(self._skip):
+            last_obs, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += float(reward)
+            total_speed += float(info.get("speed", 0.0))
+            n += 1
+            if terminated or truncated:
+                break
+        # Average speed across the skipped frames so the speed bonus represents
+        # "how fast was the car going during this action", not just the final frame.
+        info["speed"] = total_speed / max(n, 1)
+        return last_obs, total_reward, terminated, truncated, info
+
 # This defines a function on how to create the environemnt
 def make_env():
     env = gym.make("CarRacing-v3", continuous=True) # Continuous=True is important since controls are continuous
     env = SpeedInfoWrapper(env) # Exposes car speed in info dict for reward shaping
+    env = FrameSkip(env, skip=4) # Add the frame skip wrapper
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=False) # Converts to grayscale
     env = gym.wrappers.FrameStackObservation(env, stack_size=4) # Stacks the last 4 frames as channels of the image for history, so the channel dimension is now 4 rather than 3 for rgb 
     return env
@@ -111,19 +140,20 @@ def initialize_model(device):
     return model
 
 def initialize_optimizer(model):
-    # The actor optimizer only optimizes the action_mean model, and the actor_log_std_head model
-    # if you were to put the encoder in here it would be able to learn to reward itself
+   # This is the optimizer for the actor
+   # it only optimizes the actor encoder, action mean, and the log std head for the actor
     actor_optimizer = torch.optim.Adam(
-        list(model.action_mean.parameters()) + 
-        list(model.actor_log_std_head.parameters()), 
+        list(model.actor_encoder.parameters()) +
+        list(model.action_mean.parameters()) +
+        list(model.actor_log_std_head.parameters()),
         lr=LR
     )
 
-    # The critic optimizer optimizes the encoder and both the critics
+    # This is the critic optimizer
     critic_optimizer = torch.optim.Adam(
-        list(model.encoder.parameters()) +
-        list(model.critic_a.parameters()) + 
-        list(model.critic_b.parameters()), 
+        list(model.critic_encoder.parameters()) +
+        list(model.critic_a.parameters()) +
+        list(model.critic_b.parameters()),
         lr=LR
     )
 
@@ -158,7 +188,7 @@ def buffer_step(device, envs, model, replay_buffer, current_obs, episode_returns
     # This is the reward shaping
     # Gets the speed of the car in the batch frames
     speeds = np.asarray(info.get("speed", np.zeros(current_obs.shape[0])), dtype=np.float32)
-    SPEED_BONUS = 0.3
+    SPEED_BONUS = 0.05
     shaped_reward = reward + SPEED_BONUS*speeds # Adds the extra speed reward
     scaled_reward = shaped_reward*0.1  # This is just basic normilization
 
@@ -235,11 +265,12 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
     finished_episodes.clear()
     # Creates the parametrs we want to optimize for both optimizers
     actor_params = (
-        list(model.action_mean.parameters())
+        list(model.actor_encoder.parameters())
+        + list(model.action_mean.parameters())
         + list(model.actor_log_std_head.parameters())
     )
     critic_params = (
-        list(model.encoder.parameters())
+        list(model.critic_encoder.parameters())
         + list(model.critic_a.parameters())
         + list(model.critic_b.parameters())
     )
@@ -267,20 +298,15 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
             next_actions = next_dist.rsample() # Samples action form the dist (rsample maintains gradients)
             next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True) # Calculates the log prob from the width of the dist
 
-            # Runs the states through the critics
-            next_states_encoded = target_model.encoder(next_states/255.0) # Encode the states with the CNN
-            # Get the outputs of the critics (concatinates teh state with the corresponding actions)
-            next_critic_a_out = target_model.critic_a(torch.cat([next_states_encoded, next_actions], dim=-1))
-            next_critic_b_out = target_model.critic_b(torch.cat([next_states_encoded, next_actions], dim=-1))
+            # Target critic Q values
+            next_critic_a_out, next_critic_b_out = target_model.get_q_values(next_states, next_actions)
 
             # Calculates the target from the loss formulas
             target = torch.min(next_critic_a_out, next_critic_b_out) - alpha*next_log_prob
             target = rewards + (1 - dones)*LAMBDA*target
 
-        # Gets the critic outputs for the current states
-        curr_states_encoded = model.encoder(states/255.0)
-        curr_critic_a_out = model.critic_a(torch.cat([curr_states_encoded, actions], dim=-1))
-        curr_critic_b_out = model.critic_b(torch.cat([curr_states_encoded, actions], dim=-1))
+        # Current Q values
+        curr_critic_a_out, curr_critic_b_out = model.get_q_values(states, actions)
 
         # Calculate the loss for each critic just using MSE loss
         critic_a_loss = 0.5*(curr_critic_a_out - target).pow(2).mean()
@@ -304,15 +330,12 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
 
 
         # This is the actor update
-        dist = model.get_action_dist(states, detach_encoder=True) # Get a distribution from the states
+        dist = model.get_action_dist(states) # Get a distribution from the states (uses actor_encoder)
         new_actions = dist.rsample() # Get the actions
         new_log_prob = dist.log_prob(new_actions).sum(-1, keepdim=True) # Get the log prob
 
-        # Get the critic output for the current states
-        with torch.no_grad():
-            actor_states_encoded = model.encoder(states/255.0)
-        actor_curr_critic_a_out = model.critic_a(torch.cat([actor_states_encoded, new_actions], dim=-1))
-        actor_curr_critic_b_out = model.critic_b(torch.cat([actor_states_encoded, new_actions], dim=-1))
+        # Q values for the actor loss
+        actor_curr_critic_a_out, actor_curr_critic_b_out = model.get_q_values(states, new_actions)
 
         # Calculate the actor loss
         actor_loss = (alpha.detach()*new_log_prob - torch.min(actor_curr_critic_a_out, actor_curr_critic_b_out)).mean()
