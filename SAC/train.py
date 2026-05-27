@@ -9,7 +9,7 @@ from model import SAC
 from replay_buffer import ReplayBuffer
 
 PATH_TO_MODEL = None
-PATH_TO_LOGS = "runs/sac_car_racing_v8"
+PATH_TO_LOGS = "runs/sac_car_racing_v11"
 
 LR = 1e-4
 SAVE_FREQUENCY = 1000
@@ -22,14 +22,17 @@ NUM_WARMUP_STEPS = 1000
 NUM_ITERATIONS = 4000000
 NUM_ENVS = 16
 
+UPDATES_PER_ITERATION = 4
+
 BUFFER_CAPACITY = 120000
 STATE_SHAPE = (4, 96, 96)
 ACTION_DIM = 3
 
+SPEED_BONUS = 0.15 # Reward bonus for going faster
 # This is what we want the entropy to be
-TARGET_ENTROPY = -1.0
+TARGET_ENTROPY = 1.0
 # This is a hard floor for alpha since we want to keep some exploration alive
-MIN_ALPHA = 0.02
+MIN_ALPHA = 0.1
 
 # Saves model, as well as parameteres
 def save_model(model, actor_opt, critic_opt, alpha_opt, log_alpha, iteration, name="sac_car_racing"):
@@ -121,11 +124,42 @@ class FrameSkip(gym.Wrapper):
         info["speed"] = total_speed / max(n, 1)
         return last_obs, total_reward, terminated, truncated, info
 
+# This wrapper will truncate teh episode when its been earning negative orlow rewards for a while
+# This prevents the model getting stuck in bad local optimums
+class NoProgressTermination(gym.Wrapper):
+    def __init__(self, env, window=30, threshold=-8.0, grace=30):
+        super().__init__(env)
+        self._window = window         # Number of recent steps to look at
+        self._threshold = threshold   # If sum over window < threshold -> truncate
+        self._grace = grace           # Skip this many steps at episode start
+        self._reward_history = []
+        self._step_count = 0
+
+    def reset(self, **kwargs):
+        self._reward_history = []
+        self._step_count = 0
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._step_count += 1
+        self._reward_history.append(float(reward))
+        if len(self._reward_history) > self._window:
+            self._reward_history.pop(0)
+        if (
+            self._step_count > self._grace
+            and len(self._reward_history) >= self._window
+            and sum(self._reward_history) < self._threshold
+        ):
+            truncated = True
+        return obs, reward, terminated, truncated, info
+
 # This defines a function on how to create the environemnt
 def make_env():
     env = gym.make("CarRacing-v3", continuous=True) # Continuous=True is important since controls are continuous
     env = SpeedInfoWrapper(env) # Exposes car speed in info dict for reward shaping
     env = FrameSkip(env, skip=4) # Add the frame skip wrapper
+    env = NoProgressTermination(env, window=30, threshold=-8.0, grace=30)
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=False) # Converts to grayscale
     env = gym.wrappers.FrameStackObservation(env, stack_size=4) # Stacks the last 4 frames as channels of the image for history, so the channel dimension is now 4 rather than 3 for rgb 
     return env
@@ -159,13 +193,19 @@ def initialize_optimizer(model):
 
     return actor_optimizer, critic_optimizer
 
-def buffer_step(device, envs, model, replay_buffer, current_obs, episode_returns=None, episode_lengths=None, finished_episodes=None):
-    # Get the predicted action for the observation
-    with torch.no_grad():
-        action, _ = model.forward(current_obs) # Normalizes internally
+def buffer_step(device, envs, model, replay_buffer, current_obs, episode_returns=None, episode_lengths=None, finished_episodes=None, action_override=None):
+    # If an action override is provided then we use it directly
+    # what action override does, is it will give a range for the actions we want to be initializing with
+    # for example moving forwards and not steering too much, this gives us good data in the bufffer to start
+    if action_override is not None:
+        action_np = action_override.astype(np.float32, copy=False)
+    else:
+        # Get the predicted action for the observation
+        with torch.no_grad():
+            action, _ = model.forward(current_obs) # Normalizes internally
 
-    # What the policy actually outputs, all actions are [-1, 1]
-    action_np = action.cpu().numpy()
+        # What the policy actually outputs, all actions are [-1, 1]
+        action_np = action.cpu().numpy()
 
     # This creates a seperate action where the gas and brake get normalized to [0, 1]
     env_action = action_np.copy()
@@ -188,7 +228,6 @@ def buffer_step(device, envs, model, replay_buffer, current_obs, episode_returns
     # This is the reward shaping
     # Gets the speed of the car in the batch frames
     speeds = np.asarray(info.get("speed", np.zeros(current_obs.shape[0])), dtype=np.float32)
-    SPEED_BONUS = 0.05
     shaped_reward = reward + SPEED_BONUS*speeds # Adds the extra speed reward
     scaled_reward = shaped_reward*0.1  # This is just basic normilization
 
@@ -260,7 +299,18 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
 
     # Adds some starter data to the buffer
     for i in range(0, NUM_WARMUP_STEPS):
-        obs = buffer_step(device, envs, model, replay_buffer, obs, episode_returns, episode_lengths, finished_episodes)
+        # This generates ovverride data
+        warmup_actions = np.empty((NUM_ENVS, ACTION_DIM), dtype=np.float32)
+        warmup_actions[:, 0] = np.random.uniform(-0.5, 0.5, size=NUM_ENVS)  # steering
+        warmup_actions[:, 1] = np.random.uniform(-0.4, 1.0, size=NUM_ENVS)  # gas -> [0.3, 1.0]
+        warmup_actions[:, 2] = -1.0                                          # brake -> 0
+        
+        # Takes the buffer step
+        obs = buffer_step(
+            device, envs, model, replay_buffer, obs,
+            episode_returns, episode_lengths, finished_episodes,
+            action_override=warmup_actions,
+        )
     # Discard warmup episode stats — we only care about returns during real training.
     finished_episodes.clear()
     # Creates the parametrs we want to optimize for both optimizers
@@ -279,87 +329,88 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
     for iteration in range(start_iteration + 1, NUM_ITERATIONS):
         obs = buffer_step(device, envs, model, replay_buffer, obs, episode_returns, episode_lengths, finished_episodes) # Take one step and add to buffer
 
-        # Gets a sample from the replay buffer
-        states, actions, rewards, next_states, dones = replay_buffer.sample(SAMPLE_BATCH_SIZE)
-        # Converts the info to tensors and puts on GPU
-        states = torch.FloatTensor(states).to(device)
-        actions = torch.FloatTensor(actions).to(device)
-        next_states = torch.FloatTensor(next_states).to(device)
-        # Converts rewards and dones to tensors
-        rewards = torch.FloatTensor(rewards).to(device).view(-1, 1)
-        dones = torch.FloatTensor(dones).to(device).view(-1, 1)
+        for _ in range(UPDATES_PER_ITERATION):
+            # Gets a sample from the replay buffer
+            states, actions, rewards, next_states, dones = replay_buffer.sample(SAMPLE_BATCH_SIZE)
+            # Converts the info to tensors and puts on GPU
+            states = torch.FloatTensor(states).to(device)
+            actions = torch.FloatTensor(actions).to(device)
+            next_states = torch.FloatTensor(next_states).to(device)
+            # Converts rewards and dones to tensors
+            rewards = torch.FloatTensor(rewards).to(device).view(-1, 1)
+            dones = torch.FloatTensor(dones).to(device).view(-1, 1)
 
-        alpha = log_alpha.exp() # Get the current alpha value
+            alpha = log_alpha.exp() # Get the current alpha value
 
-        # This is the critic update
-        with torch.no_grad():
-            # Gets the next state and log prob from the live model
-            next_dist = model.get_action_dist(next_states) # Gets a distribution
-            next_actions = next_dist.rsample() # Samples action form the dist (rsample maintains gradients)
-            next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True) # Calculates the log prob from the width of the dist
+            # This is the critic update
+            with torch.no_grad():
+                # Gets the next state and log prob from the live model
+                next_dist = model.get_action_dist(next_states) # Gets a distribution
+                next_actions = next_dist.rsample() # Samples action form the dist (rsample maintains gradients)
+                next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True) # Calculates the log prob from the width of the dist
 
-            # Target critic Q values
-            next_critic_a_out, next_critic_b_out = target_model.get_q_values(next_states, next_actions)
+                # Target critic Q values
+                next_critic_a_out, next_critic_b_out = target_model.get_q_values(next_states, next_actions)
 
-            # Calculates the target from the loss formulas
-            target = torch.min(next_critic_a_out, next_critic_b_out) - alpha*next_log_prob
-            target = rewards + (1 - dones)*LAMBDA*target
+                # Calculates the target from the loss formulas
+                target = torch.min(next_critic_a_out, next_critic_b_out) - alpha*next_log_prob
+                target = rewards + (1 - dones)*LAMBDA*target
 
-        # Current Q values
-        curr_critic_a_out, curr_critic_b_out = model.get_q_values(states, actions)
+            # Current Q values
+            curr_critic_a_out, curr_critic_b_out = model.get_q_values(states, actions)
 
-        # Calculate the loss for each critic just using MSE loss
-        critic_a_loss = 0.5*(curr_critic_a_out - target).pow(2).mean()
-        critic_b_loss = 0.5*(curr_critic_b_out - target).pow(2).mean()
-        critic_loss = critic_a_loss + critic_b_loss # Add the losses
+            # Calculate the loss for each critic just using MSE loss
+            critic_a_loss = 0.5*(curr_critic_a_out - target).pow(2).mean()
+            critic_b_loss = 0.5*(curr_critic_b_out - target).pow(2).mean()
+            critic_loss = critic_a_loss + critic_b_loss # Add the losses
 
-        # Optimize the critic
-        critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(critic_params, 1.0)
-        critic_optimizer.step()
+            # Optimize the critic
+            critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic_params, 1.0)
+            critic_optimizer.step()
 
-        # If the critic loss goes to inifinity it just ends the training
-        if not torch.isfinite(critic_loss):
-            raise RuntimeError(
-                f"Critic loss became non-finite at iteration {iteration}: "
-                f"critic_loss={critic_loss.item()}, target stats=[min={target.min().item():.3g}, "
-                f"max={target.max().item():.3g}, mean={target.mean().item():.3g}], "
-                f"alpha={alpha.item():.3g}"
-            )
+            # If the critic loss goes to inifinity it just ends the training
+            if not torch.isfinite(critic_loss):
+                raise RuntimeError(
+                    f"Critic loss became non-finite at iteration {iteration}: "
+                    f"critic_loss={critic_loss.item()}, target stats=[min={target.min().item():.3g}, "
+                    f"max={target.max().item():.3g}, mean={target.mean().item():.3g}], "
+                    f"alpha={alpha.item():.3g}"
+                )
 
 
-        # This is the actor update
-        dist = model.get_action_dist(states) # Get a distribution from the states (uses actor_encoder)
-        new_actions = dist.rsample() # Get the actions
-        new_log_prob = dist.log_prob(new_actions).sum(-1, keepdim=True) # Get the log prob
+            # This is the actor update
+            dist = model.get_action_dist(states) # Get a distribution from the states (uses actor_encoder)
+            new_actions = dist.rsample() # Get the actions
+            new_log_prob = dist.log_prob(new_actions).sum(-1, keepdim=True) # Get the log prob
 
-        # Q values for the actor loss
-        actor_curr_critic_a_out, actor_curr_critic_b_out = model.get_q_values(states, new_actions)
+            # Q values for the actor loss
+            actor_curr_critic_a_out, actor_curr_critic_b_out = model.get_q_values(states, new_actions)
 
-        # Calculate the actor loss
-        actor_loss = (alpha.detach()*new_log_prob - torch.min(actor_curr_critic_a_out, actor_curr_critic_b_out)).mean()
+            # Calculate the actor loss
+            actor_loss = (alpha.detach()*new_log_prob - torch.min(actor_curr_critic_a_out, actor_curr_critic_b_out)).mean()
 
-        # Optimize the actor
-        actor_optimizer.zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(actor_params, 1.0)
-        actor_optimizer.step()
+            # Optimize the actor
+            actor_optimizer.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(actor_params, 1.0)
+            actor_optimizer.step()
 
-        # Calculate loss for alpha and optimize it
-        alpha_loss = -(log_alpha * (new_log_prob + target_entropy).detach()).mean()
-        alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        alpha_optimizer.step()
-        # Floor on log_alpha so alpha never decays below MIN_ALPHA. Without this the
-        # auto-alpha update will happily push alpha to ~0 and the policy collapses.
-        with torch.no_grad():
-            log_alpha.clamp_(min=math.log(MIN_ALPHA))
+            # Calculate loss for alpha and optimize it
+            alpha_loss = -(log_alpha * (new_log_prob + target_entropy).detach()).mean()
+            alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            alpha_optimizer.step()
+            # Floor on log_alpha so alpha never decays below MIN_ALPHA. Without this the
+            # auto-alpha update will happily push alpha to ~0 and the policy collapses.
+            with torch.no_grad():
+                log_alpha.clamp_(min=math.log(MIN_ALPHA))
 
-        # This will move the target model towards the live model at a rate of TAU
-        with torch.no_grad():
-            for p, p_t in zip(model.parameters(), target_model.parameters()):
-                p_t.data.mul_(1 - TAU).add_(p.data, alpha=TAU)
+            # This will move the target model towards the live model at a rate of TAU
+            with torch.no_grad():
+                for p, p_t in zip(model.parameters(), target_model.parameters()):
+                    p_t.data.mul_(1 - TAU).add_(p.data, alpha=TAU)
 
         # Save model every SAVE_FREQUENCY steps
         if iteration % SAVE_FREQUENCY == 0:
