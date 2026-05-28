@@ -8,8 +8,8 @@ import numpy as np
 from model import SAC
 from replay_buffer import ReplayBuffer
 
-PATH_TO_MODEL = None
-PATH_TO_LOGS = "runs/sac_car_racing_v11"
+PATH_TO_MODEL = "saves\sac_car_racing_iter_7000.pth"
+PATH_TO_LOGS = "runs/sac_car_racing_v12"
 
 LR = 1e-4
 SAVE_FREQUENCY = 1000
@@ -24,7 +24,7 @@ NUM_ENVS = 16
 
 UPDATES_PER_ITERATION = 4
 
-BUFFER_CAPACITY = 120000
+BUFFER_CAPACITY = 200000
 STATE_SHAPE = (4, 96, 96)
 ACTION_DIM = 3
 
@@ -33,6 +33,20 @@ SPEED_BONUS = 0.15 # Reward bonus for going faster
 TARGET_ENTROPY = 1.0
 # This is a hard floor for alpha since we want to keep some exploration alive
 MIN_ALPHA = 0.1
+
+# This function will slightly shift the input images by a certain padding (number of pixels)
+# this gives a bit more randomness to the model and prevents the crtici values from flattening
+def random_shift(images, pad=4):
+    n, c, h, w = images.shape # Gets the image dimensions
+    padded = torch.nn.functional.pad(images, (pad, pad, pad, pad), mode="replicate")
+    shifts = torch.randint(0, 2 * pad + 1, size=(n, 2), device=images.device)
+    ys = torch.arange(h, device=images.device).view(1, h, 1).float()
+    xs = torch.arange(w, device=images.device).view(1, 1, w).float()
+    
+    ys = ((ys + shifts[:, 0].view(n, 1, 1).float()) / (h + 2 * pad - 1)) * 2 - 1
+    xs = ((xs + shifts[:, 1].view(n, 1, 1).float()) / (w + 2 * pad - 1)) * 2 - 1
+    grid = torch.stack([xs.expand(n, h, w), ys.expand(n, h, w)], dim=-1)
+    return torch.nn.functional.grid_sample(padded, grid, mode="nearest", align_corners=True)
 
 # Saves model, as well as parameteres
 def save_model(model, actor_opt, critic_opt, alpha_opt, log_alpha, iteration, name="sac_car_racing"):
@@ -54,9 +68,9 @@ def save_model(model, actor_opt, critic_opt, alpha_opt, log_alpha, iteration, na
     print(f"Model saved to {filename}")
 
 def load_model(model, actor_opt, critic_opt, filename, device):
-    # If the filepath doesn't exist it just returns iteration 0 and a new fresh log_alpha
+    # If the filepath doesn't exist it just returns iteration 0, a new fresh
     if not os.path.exists(filename):
-        return 0, torch.zeros(1, requires_grad=True, device=device)
+        return 0, torch.zeros(1, requires_grad=True, device=device), None
 
     # Loads the model checkpoint
     checkpoint = torch.load(filename, map_location=device)
@@ -70,8 +84,10 @@ def load_model(model, actor_opt, critic_opt, filename, device):
     log_alpha_value = checkpoint["log_alpha"].detach().to(device).view(1)
     log_alpha = log_alpha_value.clone().requires_grad_(True)
 
+    alpha_opt_state_dict = checkpoint.get("alpha_opt_state_dict")
+
     print(f"Loaded checkpoint: {filename}")
-    return checkpoint["iteration"], log_alpha # Returns the iteration and the log_alpha
+    return checkpoint["iteration"], log_alpha, alpha_opt_state_dict
 
 def initialize_device():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -272,13 +288,17 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
 
     # Loads the model and gets the start iteration
     start_iteration = 0
+    alpha_opt_state_dict = None
     if PATH_TO_MODEL is not None:
-        start_iteration, log_alpha = load_model(
+        start_iteration, log_alpha, alpha_opt_state_dict = load_model(
             model, actor_optimizer, critic_optimizer, PATH_TO_MODEL, device
         )
 
     # Creates an optimizer for alpha
     alpha_optimizer = torch.optim.Adam([log_alpha], lr=LR)
+
+    if alpha_opt_state_dict is not None:
+        alpha_optimizer.load_state_dict(alpha_opt_state_dict)
 
     # This creates out target model (Copy of live model)
     # This model is what is actually used to calculate the loss in the training loop
@@ -342,22 +362,26 @@ def train(device, envs, model, actor_optimizer, critic_optimizer, writer, replay
 
             alpha = log_alpha.exp() # Get the current alpha value
 
+            # Gets shifted images
+            states_aug = random_shift(states)
+            next_states_aug = random_shift(next_states)
+
             # This is the critic update
             with torch.no_grad():
                 # Gets the next state and log prob from the live model
-                next_dist = model.get_action_dist(next_states) # Gets a distribution
+                next_dist = model.get_action_dist(next_states_aug) # Gets a distribution
                 next_actions = next_dist.rsample() # Samples action form the dist (rsample maintains gradients)
                 next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True) # Calculates the log prob from the width of the dist
 
                 # Target critic Q values
-                next_critic_a_out, next_critic_b_out = target_model.get_q_values(next_states, next_actions)
+                next_critic_a_out, next_critic_b_out = target_model.get_q_values(next_states_aug, next_actions)
 
                 # Calculates the target from the loss formulas
                 target = torch.min(next_critic_a_out, next_critic_b_out) - alpha*next_log_prob
                 target = rewards + (1 - dones)*LAMBDA*target
 
             # Current Q values
-            curr_critic_a_out, curr_critic_b_out = model.get_q_values(states, actions)
+            curr_critic_a_out, curr_critic_b_out = model.get_q_values(states_aug, actions)
 
             # Calculate the loss for each critic just using MSE loss
             critic_a_loss = 0.5*(curr_critic_a_out - target).pow(2).mean()
