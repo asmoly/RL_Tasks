@@ -33,8 +33,8 @@ def generate_bar_chart(results):
     bars = plt.bar(models, rewards, color=colors, edgecolor='black', width=0.6)
 
     plt.title('Model Performance Comparison', fontsize=14, fontweight='bold', pad=15)
-    plt.xlabel('AI Models', fontsize=12, labelpad=10)
-    plt.ylabel('Total Reward', fontsize=12, labelpad=10)
+    plt.xlabel('Models', fontsize=12, labelpad=10)
+    plt.ylabel('Cumilative Reward', fontsize=12, labelpad=10)
 
     for bar in bars:
         yval = bar.get_height()
