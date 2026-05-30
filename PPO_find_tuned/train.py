@@ -6,12 +6,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import PPO
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_734.pth"
+PATH_TO_MODEL = "saves\ppo_car_racing_iter_638.pth"
 SAVE_FREQUENCY = 1
-PATH_TO_LOGS = "runs/ppo_car_racing_v4"
+PATH_TO_LOGS = "runs/ppo_car_racing_v1"
 
 TOTAL_ITERATIONS = 2000
-ROLLOUT_STEPS = 4096
+ROLLOUT_STEPS = 2056
 MINI_BATCH_SIZE = 512
 EPOCHS = 10
 LR = 1e-4 # Initial LR
@@ -19,6 +19,11 @@ LR = 1e-4 # Initial LR
 EPSILON = 0.1 # Make 0.1 at the start of training
 CRITIC_WEIGHT = 0.5
 ENTROPY_WEIGHT = 0.01 # Initial entropy coefficient
+
+# If the approximate KL between old and new policy on a minibatch exceeds this,
+# stop the epoch loop early. Prevents the policy from moving too far in one update
+# and trashing the rollout data we already collected. Typical values: 0.01–0.03.
+KL_TARGET = 0.015
 
 # These are teh params for optimizing the LR
 META_LR = 1e-7 # This is the learning rate for optimizing the learning rate
@@ -84,6 +89,7 @@ def make_env():
     env = gym.make("CarRacing-v3", continuous=True) # Continuous=True is important since controls are continuous
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=False) # Converts to grayscale
     env = gym.wrappers.FrameStackObservation(env, stack_size=4) # Stacks the last 4 frames as channels of the image for history, so the channel dimension is now 4 rather than 3 for rgb 
+    env = gym.wrappers.RecordEpisodeStatistics(env) # This tracks per episode rewards for logging
     return env
 
 def initialize_env(num_envs=16):
@@ -118,6 +124,10 @@ def collect_rollout(envs, model, current_obs, num_steps, device):
     rewards_batch = []
     dones_batch = []
 
+    # Contains the real episode rewards and lengths
+    episode_returns = []
+    episode_lengths = []
+
     for _ in range(num_steps):
         obs_batch.append(current_obs) # State
         
@@ -133,6 +143,14 @@ def collect_rollout(envs, model, current_obs, num_steps, device):
 
         env_action = torch.clamp(action, -1, 1).cpu().numpy() # Clip the actions to match what the environment expects
         next_obs, reward, terminated, truncated, info = envs.step(env_action)
+
+        if "episode" in info:
+            mask = info.get("_episode")
+            if mask is not None:
+                for i, finished in enumerate(mask):
+                    if finished:
+                        episode_returns.append(float(info["episode"]["r"][i]))
+                        episode_lengths.append(int(info["episode"]["l"][i]))
 
         current_obs = torch.from_numpy(next_obs).to(device).float()
         
@@ -152,7 +170,9 @@ def collect_rollout(envs, model, current_obs, num_steps, device):
         "values": torch.stack(values_batch),
         "rewards": torch.stack(rewards_batch),
         "dones": torch.stack(dones_batch),
-        "last_obs": current_obs
+        "last_obs": current_obs,
+        "episode_returns": episode_returns,
+        "episode_lengths": episode_lengths,
     }
     
 
@@ -200,6 +220,7 @@ def train(device, envs, model, optimizer, current_lr, start_iteration, writer):
     for iteration in range(start_iteration + 1, TOTAL_ITERATIONS):
         data = collect_rollout(envs, model, obs, ROLLOUT_STEPS, device)
         obs = data["last_obs"] # Save for the next iteration
+        print("Collected Rollout")
 
         with torch.no_grad():
             _, _, last_value = model(obs) # Gets the value for the state right after the rollout
@@ -219,7 +240,14 @@ def train(device, envs, model, optimizer, current_lr, start_iteration, writer):
         total_actor_loss = 0
         total_critic_loss = 0
         total_entropy = 0
+        total_approx_kl = 0
+        num_updates = 0  # Tracks how many minibatches actually ran (KL early-stop may cut us short)
+
+        # Flag flips on if any minibatch's KL exceeds KL_TARGET; we then break out of both loops
+        should_stop_early = False
         for epoch in range(EPOCHS):
+            if should_stop_early:
+                break
             indices = torch.randperm(batch_size) # Shuffles indicies for better learning
 
             for start in range(0, batch_size, MINI_BATCH_SIZE): # Loops through the mini batches within the large batch
@@ -241,6 +269,15 @@ def train(device, envs, model, optimizer, current_lr, start_iteration, writer):
                 logratio = new_logprobs - b_logprobs[mb_idx] # Takes the new models lop probs and divides by the old models log probs
                 ratio = torch.exp(logratio) # e^logratio to get rid of the log
 
+                # This basically checks if the model is jumping way to much in one of the epochs
+                # then future epochs will be affected by it and it will only worsen the model
+                # so it stops training early
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - logratio).mean().item()
+                if approx_kl > KL_TARGET:
+                    should_stop_early = True
+                    break
+
                 # --- C. Clipped Actor Loss ---
                 # Use normalized advantages for stability
                 mb_advantages = b_advantages[mb_idx] # Gets the advantages from the data
@@ -256,11 +293,12 @@ def train(device, envs, model, optimizer, current_lr, start_iteration, writer):
                 # And we take the mean to get a concret float as the loss
                 actor_loss = -torch.min(l_clip_1, l_clip_2).mean() # Then we are taking the minimum of them
 
-                # This is the loss for the critic, again can be found in my slides
-                # This is just mse loss
-                # In formula this should be negative but again we are minimizing so we don't need to worry about that
-                critic_loss = 0.5*(new_value.flatten() - b_returns[mb_idx]).pow(2).mean()
-                # 0.5 is to get rid of the 2 power which comes down when differentiation happens (makes gradient cleaner)
+                # This clips the critics so that crazy critic outputs don't ruin the actor
+                new_value_flat = new_value.flatten()
+                v_clipped = b_values[mb_idx] + torch.clamp(new_value_flat - b_values[mb_idx], -EPSILON, EPSILON)
+                v_loss_unclipped = (new_value_flat - b_returns[mb_idx]).pow(2)
+                v_loss_clipped   = (v_clipped - b_returns[mb_idx]).pow(2)
+                critic_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
                 # Total loss equation
                 loss = actor_loss + (CRITIC_WEIGHT*critic_loss) - (ENTROPY_WEIGHT*entropy)
@@ -296,11 +334,15 @@ def train(device, envs, model, optimizer, current_lr, start_iteration, writer):
                 total_actor_loss += actor_loss.item()
                 total_critic_loss += critic_loss.item()
                 total_entropy += entropy.item()
+                total_approx_kl += approx_kl
+                num_updates += 1
 
-        avg_total_loss = total_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
-        avg_actor_loss = total_actor_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
-        avg_critic_loss = total_critic_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
-        avg_entropy = total_entropy/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
+        denom = max(num_updates, 1)  # This gets the number of updates (avoids division by 0)
+        avg_total_loss = total_loss/denom
+        avg_actor_loss = total_actor_loss/denom
+        avg_critic_loss = total_critic_loss/denom
+        avg_entropy = total_entropy/denom
+        avg_approx_kl = total_approx_kl/denom
 
 
         rewards_unnorm = data["rewards"]/0.1 # Unnormalize the rewards
@@ -314,8 +356,20 @@ def train(device, envs, model, optimizer, current_lr, start_iteration, writer):
         writer.add_scalar("Hyper/LR", current_lr, iteration)
         writer.add_scalar("Reward/MeanPerStep", mean_reward, iteration)
         writer.add_scalar("Reward/SumPerRollout", sum_reward_per_env, iteration)
+        writer.add_scalar("Debug/ApproxKL", avg_approx_kl, iteration)
+        writer.add_scalar("Debug/UpdatesPerIter", num_updates, iteration)
 
-        print(f"Iteration: {iteration}, Mean Reward = {mean_reward:.3f}, Rollout Return = {sum_reward_per_env:.2f}, Total Loss = {avg_total_loss}, Actor Loss = {avg_actor_loss}, Critic Loss = {avg_critic_loss}, LR = {current_lr:.2e}")
+        # Log REAL episode returns from any episodes that completed during the rollout
+        # (only if at least one episode finished — otherwise skip to avoid logging stale data)
+        ep_return_str = "n/a"
+        if len(data["episode_returns"]) > 0:
+            avg_ep_return = sum(data["episode_returns"]) / len(data["episode_returns"])
+            avg_ep_length = sum(data["episode_lengths"]) / len(data["episode_lengths"])
+            writer.add_scalar("Reward/EpisodeReturn", avg_ep_return, iteration)
+            writer.add_scalar("Reward/EpisodeLength", avg_ep_length, iteration)
+            ep_return_str = f"{avg_ep_return:.2f}"
+
+        print(f"Iteration: {iteration}, Episode Return = {ep_return_str}, Mean Reward = {mean_reward:.3f}, Total Loss = {avg_total_loss:.4f}, KL = {avg_approx_kl:.4f}, Updates = {num_updates}, LR = {current_lr:.2e}")
 
         if iteration%SAVE_FREQUENCY == 0:
             save_ppo_model(model, optimizer, current_lr, iteration)
