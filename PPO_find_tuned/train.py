@@ -302,13 +302,20 @@ def train(device, envs, model, optimizer, current_lr, start_iteration, writer):
         avg_critic_loss = total_critic_loss/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
         avg_entropy = total_entropy/((batch_size/MINI_BATCH_SIZE)*EPOCHS)
 
+
+        rewards_unnorm = data["rewards"]/0.1 # Unnormalize the rewards
+        mean_reward = rewards_unnorm.mean().item() # Calculate the average reward
+        sum_reward_per_env = rewards_unnorm.sum(dim=0).mean().item() # This is the average cumilative reward
+
         writer.add_scalar("Loss/Actor", avg_actor_loss, iteration)
         writer.add_scalar("Loss/Critic", avg_critic_loss, iteration)
         writer.add_scalar("Loss/Total", avg_total_loss, iteration)
         writer.add_scalar("Entropy", avg_entropy, iteration)
         writer.add_scalar("Hyper/LR", current_lr, iteration)
+        writer.add_scalar("Reward/MeanPerStep", mean_reward, iteration)
+        writer.add_scalar("Reward/SumPerRollout", sum_reward_per_env, iteration)
 
-        print(f"Iteration: {iteration}, Total Loss = {avg_total_loss}, Actor Loss = {avg_actor_loss}, Critic Loss = {avg_critic_loss}, LR = {current_lr:.2e}")
+        print(f"Iteration: {iteration}, Mean Reward = {mean_reward:.3f}, Rollout Return = {sum_reward_per_env:.2f}, Total Loss = {avg_total_loss}, Actor Loss = {avg_actor_loss}, Critic Loss = {avg_critic_loss}, LR = {current_lr:.2e}")
 
         if iteration%SAVE_FREQUENCY == 0:
             save_ppo_model(model, optimizer, current_lr, iteration)
