@@ -4,12 +4,13 @@ import os
 
 from train import initialize_device, initialize_model
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_734.pth"
+PATH_TO_MODEL = "saves\ppo_car_racing_iter_870.pth"
 
 def initialize_run_env():
-    env = gym.make("CarRacing-v3", continuous=True, render_mode="human")
+    env = gym.make("CarRacing-v3", continuous=True, render_mode="human") # Continuous=True is important since controls are continuous
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=False) # Converts to grayscale
     env = gym.wrappers.FrameStackObservation(env, stack_size=4) # Stacks the last 4 frames as channels of the image for history, so the channel dimension is now 4 rather than 3 for rgb 
+    env = gym.wrappers.RecordEpisodeStatistics(env) # This tracks per episode rewards for logging
     return env
 
 def load_model_for_testing(path_to_model, device):

@@ -6,8 +6,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import PPO
 
-PATH_TO_MODEL = "saves\ppo_car_racing_iter_652.pth"
-SAVE_FREQUENCY = 1
+PATH_TO_MODEL = "saves\ppo_car_racing_iter_661.pth"
+SAVE_FREQUENCY = 5
 PATH_TO_LOGS = "runs/ppo_car_racing_v1"
 
 TOTAL_ITERATIONS = 2000
