@@ -3,10 +3,13 @@ import matplotlib.pyplot as plt
 from operator import itemgetter
 from pathlib import Path
 
-from Benchmarkers import PPO_Benchmarker, SAC_Benchmarker
+from Benchmarkers import PPO_Benchmarker, SAC_Benchmarker, PPO_Fine_Tuned_Benchmarker
 
 PATH_TO_PPO_MODELS = "ppo_models/"
 PATH_TO_SAC_MODELS = "sac_models/"
+PATH_TO_PPOft_MODELS = "ppo_fine_tuned/"
+
+ITERATIONS = 3
 
 
 def initialize_device():
@@ -51,19 +54,34 @@ def main():
     device = initialize_device()
     ppo_bench = PPO_Benchmarker(device)
     sac_bench = SAC_Benchmarker(device)
+    ppoft_bench = PPO_Fine_Tuned_Benchmarker(device)
 
     ppo_models = models_in_directory(PATH_TO_PPO_MODELS)
     sac_models = models_in_directory(PATH_TO_SAC_MODELS)
+    ppoft_models = models_in_directory(PATH_TO_PPOft_MODELS)
 
     results = []
 
     for model in ppo_models:
-        score = ppo_bench.benchmark_model(model)
-        results.append((model, score))
+        score = 0
+        for i in range(ITERATIONS):
+            score += ppo_bench.benchmark_model(model)
+        
+        results.append((model, score/ITERATIONS))
 
     for model in sac_models:
-        score = sac_bench.benchmark_model(model)
-        results.append((model, score))
+        score = 0
+        for i in range(ITERATIONS):
+            score += sac_bench.benchmark_model(model)
+        
+        results.append((model, score/ITERATIONS))
+
+    for model in ppoft_models:
+        score = 0
+        for i in range(ITERATIONS):
+            score += ppoft_bench.benchmark_model(model)
+        
+        results.append((model, score/ITERATIONS))
 
     sorted_results = sorted(results, key=lambda x: x[1], reverse=True)
     

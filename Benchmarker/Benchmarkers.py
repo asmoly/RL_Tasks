@@ -4,6 +4,7 @@ import gymnasium as gym
 
 from PPO_model import PPO
 from SAC_model import SAC
+from PPO_fine_tuned_model import PPOft
 
 class Benchmarker:
     def __init__(self, device):
@@ -51,6 +52,30 @@ class Benchmarker:
 
         return total_reward
 
+class PPO_Fine_Tuned_Benchmarker(Benchmarker):
+    def __init__(self, device):
+        super().__init__(device)
+
+    def initialize_run_env(self):
+        env = gym.make("CarRacing-v3", continuous=True) # Continuous=True is important since controls are continuous
+        env = gym.wrappers.GrayscaleObservation(env, keep_dim=False) # Converts to grayscale
+        env = gym.wrappers.FrameStackObservation(env, stack_size=4) # Stacks the last 4 frames as channels of the image for history, so the channel dimension is now 4 rather than 3 for rgb 
+        env = gym.wrappers.RecordEpisodeStatistics(env) # This tracks per episode rewards for logging
+        return env
+
+    def load_model(self, path_to_model):
+        model = PPOft().to(self.device)
+        
+        if os.path.exists(path_to_model):
+            checkpoint = torch.load(path_to_model, map_location=self.device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            model.eval()
+
+            print(f"Loaded model from {path_to_model}")
+            return model
+
+        print(f"Error: Could not find {path_to_model}")
+    
 
 class PPO_Benchmarker(Benchmarker):
     def __init__(self, device):
